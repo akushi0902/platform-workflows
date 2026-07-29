@@ -1,151 +1,125 @@
-name: Full Repository Clone - Files, Branches, Rules & Branch Protection
+name: GitHub Repository Replica
 
 on:
   workflow_dispatch:
     inputs:
-      new_repo_name:
-        description: 'New Repository Name'
+      github_token:
+        description: "GitHub Personal Access Token"
         required: true
         type: string
+
       source_repo_url:
-        description: 'Source Repository URL'
+        description: "Source Repository URL"
         required: true
         type: string
-      visibility:
-        description: 'Repository Visibility'
-        required: false
-        default: 'private'
-        type: choice
-        options:
-          - private
-          - public
-      team_slug:
-        description: 'Team Slug (optional - for CODEOWNERS)'
-        required: false
+
+      target_repo_name:
+        description: "Target Repository Name"
+        required: true
         type: string
-      copy_branch_protection:
-        description: 'Copy Branch Protection Rules'
-        required: false
-        default: 'true'
-        type: choice
-        options:
-          - 'true'
-          - 'false'
-      copy_rulesets:
-        description: 'Copy Repository Rulesets'
-        required: false
-        default: 'true'
-        type: choice
-        options:
-          - 'true'
-          - 'false'
 
 jobs:
-  clone-repo:
+  clone-repository:
     runs-on: ubuntu-latest
-    env:
-      GH_TOKEN: ${{ secrets.GH_PAT }}
-      ORG: akushi0902        # ✅ Updated username
 
     steps:
-      - name: Validate Inputs
+
+      - name: Install GitHub CLI
         run: |
-          if [ -z "${{ inputs.new_repo_name }}" ]; then
-            echo "❌ new_repo_name is required!"
-            exit 1
+          gh --version
+
+      - name: Configure Git
+        run: |
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+
+      - name: Authenticate GitHub
+        env:
+          GH_TOKEN: ${{ github.event.inputs.github_token }}
+        run: |
+          gh auth status
+
+      - name: Get Authenticated User
+        id: github_user
+        env:
+          GH_TOKEN: ${{ github.event.inputs.github_token }}
+        run: |
+          USERNAME=$(gh api user --jq '.login')
+          echo "username=$USERNAME" >> $GITHUB_OUTPUT
+
+          echo "Authenticated User: $USERNAME"
+
+      - name: Create Target Repository
+        env:
+          GH_TOKEN: ${{ github.event.inputs.github_token }}
+        run: |
+
+          gh repo create \
+            "${{ steps.github_user.outputs.username }}/${{ github.event.inputs.target_repo_name }}" \
+            --private
+
+      - name: Clone Source Repository
+        run: |
+
+          git clone --bare \
+            "${{ github.event.inputs.source_repo_url }}" \
+            repo.git
+
+      - name: Push All Branches
+        env:
+          GH_TOKEN: ${{ github.event.inputs.github_token }}
+        run: |
+
+          cd repo.git
+
+          TARGET_URL="https://${GH_TOKEN}@github.com/${{ steps.github_user.outputs.username }}/${{ github.event.inputs.target_repo_name }}.git"
+
+          git remote add target "$TARGET_URL"
+
+          git push --all target
+
+      - name: Push All Tags
+        env:
+          GH_TOKEN: ${{ github.event.inputs.github_token }}
+        run: |
+
+          cd repo.git
+
+          TARGET_URL="https://${GH_TOKEN}@github.com/${{ steps.github_user.outputs.username }}/${{ github.event.inputs.target_repo_name }}.git"
+
+          if ! git remote | grep -q target; then
+            git remote add target "$TARGET_URL"
           fi
-          if [ -z "${{ inputs.source_repo_url }}" ]; then
-            echo "❌ source_repo_url is required!"
-            exit 1
-          fi
-          echo "✅ Inputs validated"
 
-      - name: Create New Repository
-        run: |
-          echo "📦 Creating new repo: ${{ inputs.new_repo_name }}"
-          gh repo create ${{ inputs.new_repo_name }} \
-            --${{ inputs.visibility }}
-          echo "✅ Repo created!"
+          git push target --tags
 
-      - name: Verify Repository Exists
+      - name: Verify Repository
+        env:
+          GH_TOKEN: ${{ github.event.inputs.github_token }}
         run: |
-          echo "🔍 Verifying repo exists..."
-          sleep 5
-          gh repo view $ORG/${{ inputs.new_repo_name }} && echo "✅ Repo confirmed!" || exit 1
 
-      - name: Mirror Clone Source Repository
-        run: |
-          echo "🔄 Mirror cloning source repo..."
-          git clone --mirror https://x-access-token:${{ secrets.GH_PAT }}@github.com/$(echo "${{ inputs.source_repo_url }}" | sed 's/https:\/\/github.com\///') repo-mirror
-          echo "✅ Mirror clone complete!"
+          echo ""
+          echo "====================================="
+          echo "Repository Clone Completed"
+          echo "====================================="
 
-      - name: Push Mirror to New Repository
-        run: |
-          echo "🚀 Pushing mirror to new repo..."
-          cd repo-mirror
-          git remote set-url origin https://x-access-token:${{ secrets.GH_PAT }}@github.com/$ORG/${{ inputs.new_repo_name }}.git
-          git push --mirror
-          echo "✅ Mirror push complete!"
+          echo "Source Repository:"
+          echo "${{ github.event.inputs.source_repo_url }}"
 
-      - name: Copy Branch Protection Rules
-        if: ${{ inputs.copy_branch_protection == 'true' }}
-        run: |
-          echo "🔒 Copying branch protection rules..."
-          SOURCE_OWNER=$(echo "${{ inputs.source_repo_url }}" | sed 's/.*github.com\///' | cut -d'/' -f1)
-          SOURCE_REPO=$(echo "${{ inputs.source_repo_url }}" | sed 's/.*github.com\///' | cut -d'/' -f2 | sed 's/.git//')
-          
-          BRANCHES=$(gh api repos/$SOURCE_OWNER/$SOURCE_REPO/branches --jq '.[].name')
-          
-          for BRANCH in $BRANCHES; do
-            echo "Checking branch: $BRANCH"
-            PROTECTION=$(gh api repos/$SOURCE_OWNER/$SOURCE_REPO/branches/$BRANCH/protection 2>/dev/null || echo "null")
-            
-            if [ "$PROTECTION" != "null" ]; then
-              echo "Copying protection for branch: $BRANCH"
-              echo $PROTECTION | gh api --method PUT \
-                repos/$ORG/${{ inputs.new_repo_name }}/branches/$BRANCH/protection \
-                --input - || echo "⚠️ Could not copy protection for $BRANCH"
-            fi
-          done
-          echo "✅ Branch protection rules copied!"
+          echo ""
+          echo "Target Repository:"
 
-      - name: Copy Repository Rulesets
-        if: ${{ inputs.copy_rulesets == 'true' }}
-        run: |
-          echo "📋 Copying repository rulesets..."
-          SOURCE_OWNER=$(echo "${{ inputs.source_repo_url }}" | sed 's/.*github.com\///' | cut -d'/' -f1)
-          SOURCE_REPO=$(echo "${{ inputs.source_repo_url }}" | sed 's/.*github.com\///' | cut -d'/' -f2 | sed 's/.git//')
-          
-          gh api repos/$SOURCE_OWNER/$SOURCE_REPO/rulesets \
-            --jq '.[]' | while read ruleset; do
-            gh api --method POST repos/$ORG/${{ inputs.new_repo_name }}/rulesets \
-              --input - <<< "$ruleset" || echo "⚠️ Could not copy ruleset"
-          done
-          echo "✅ Rulesets copied!"
+          echo "https://github.com/${{ steps.github_user.outputs.username }}/${{ github.event.inputs.target_repo_name }}"
 
-      - name: Setup CODEOWNERS
-        if: ${{ inputs.team_slug != '' }}
+      - name: List Branches
+        env:
+          GH_TOKEN: ${{ github.event.inputs.github_token }}
         run: |
-          echo "👥 Setting up CODEOWNERS..."
-          git clone https://x-access-token:${{ secrets.GH_PAT }}@github.com/$ORG/${{ inputs.new_repo_name }}.git codeowners-repo
-          cd codeowners-repo
-          mkdir -p .github
-          echo "* @$ORG/${{ inputs.team_slug }}" > .github/CODEOWNERS
-          git config user.email "actions@github.com"
-          git config user.name "GitHub Actions"
-          git add .github/CODEOWNERS
-          git commit -m "chore: add CODEOWNERS file" || echo "Nothing to commit"
-          git push
-          echo "✅ CODEOWNERS setup complete!"
 
-      - name: Summary
+          gh repo view \
+            "${{ steps.github_user.outputs.username }}/${{ github.event.inputs.target_repo_name }}" \
+            --json url
+
+      - name: Success
         run: |
-          echo "🎉 Repository clone complete!"
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          echo "✅ Source: ${{ inputs.source_repo_url }}"
-          echo "✅ Destination: https://github.com/$ORG/${{ inputs.new_repo_name }}"
-          echo "✅ Visibility: ${{ inputs.visibility }}"
-          echo "✅ Branch Protection: ${{ inputs.copy_branch_protection }}"
-          echo "✅ Rulesets: ${{ inputs.copy_rulesets }}"
-          echo "✅ Team: ${{ inputs.team_slug }}"
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "Repository replication completed successfully."
