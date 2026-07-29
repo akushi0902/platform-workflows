@@ -13,6 +13,15 @@ on:
         required: true
         type: string
 
+      visibility:
+        description: "Repository Visibility"
+        required: true
+        default: private
+        type: choice
+        options:
+          - private
+          - public
+
 jobs:
   clone-repository:
     runs-on: ubuntu-latest
@@ -48,16 +57,19 @@ jobs:
         run: |
           OWNER="${{ steps.github_user.outputs.username }}"
           REPO="${{ github.event.inputs.target_repo_name }}"
+          VISIBILITY="${{ github.event.inputs.visibility }}"
 
           if gh repo view "$OWNER/$REPO" >/dev/null 2>&1; then
-            echo "Repository already exists"
+            echo "✅ Repository already exists"
           else
-            gh repo create "$OWNER/$REPO" --private
-            echo "Repository created"
+            gh repo create "$OWNER/$REPO" --$VISIBILITY
+            echo "✅ Repository created as $VISIBILITY"
           fi
 
       - name: Mirror Clone Source Repository
         run: |
+          echo "📥 Cloning source repository..."
+
           git clone --mirror \
             "${{ github.event.inputs.source_repo_url }}" \
             repo.git
@@ -68,22 +80,30 @@ jobs:
 
           TARGET_URL="https://x-access-token:${GH_TOKEN}@github.com/${{ steps.github_user.outputs.username }}/${{ github.event.inputs.target_repo_name }}.git"
 
+          echo "🚀 Pushing all branches, tags and refs..."
+
           git remote set-url origin "$TARGET_URL"
 
           git push --mirror
 
       - name: Verify Repository
         run: |
+          echo ""
           echo "====================================="
           echo "Repository Clone Completed"
           echo "====================================="
+          echo ""
           echo "Source Repository:"
           echo "${{ github.event.inputs.source_repo_url }}"
           echo ""
           echo "Target Repository:"
           echo "https://github.com/${{ steps.github_user.outputs.username }}/${{ github.event.inputs.target_repo_name }}"
+          echo ""
+          echo "Visibility:"
+          echo "${{ github.event.inputs.visibility }}"
+          echo ""
 
-      - name: Display Repository URL
+      - name: Display Repository Details
         run: |
           gh repo view \
             "${{ steps.github_user.outputs.username }}/${{ github.event.inputs.target_repo_name }}" \
@@ -91,7 +111,10 @@ jobs:
 
       - name: List Branches
         run: |
-          gh api repos/${{ steps.github_user.outputs.username }}/${{ github.event.inputs.target_repo_name }}/branches \
+          echo "📋 Branches copied:"
+          
+          gh api \
+            repos/${{ steps.github_user.outputs.username }}/${{ github.event.inputs.target_repo_name }}/branches \
             --jq '.[].name'
 
       - name: Success
@@ -99,4 +122,5 @@ jobs:
           echo "✅ Repository replication completed successfully."
           echo "✅ All branches copied."
           echo "✅ All tags copied."
-          echo "✅ Repository contents copied."
+          echo "✅ All repository contents copied."
+          echo "✅ Visibility: ${{ github.event.inputs.visibility }}"
