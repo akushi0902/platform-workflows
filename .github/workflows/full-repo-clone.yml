@@ -45,7 +45,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ secrets.GH_PAT }}
-      ORG: akushii-op
+      ORG: akushi0902        # ✅ Updated username
 
     steps:
       - name: Validate Inputs
@@ -63,15 +63,20 @@ jobs:
       - name: Create New Repository
         run: |
           echo "📦 Creating new repo: ${{ inputs.new_repo_name }}"
-          gh repo create $ORG/${{ inputs.new_repo_name }} \
-            --${{ inputs.visibility }} \
-            --confirm || true
+          gh repo create ${{ inputs.new_repo_name }} \
+            --${{ inputs.visibility }}
           echo "✅ Repo created!"
+
+      - name: Verify Repository Exists
+        run: |
+          echo "🔍 Verifying repo exists..."
+          sleep 5
+          gh repo view $ORG/${{ inputs.new_repo_name }} && echo "✅ Repo confirmed!" || exit 1
 
       - name: Mirror Clone Source Repository
         run: |
           echo "🔄 Mirror cloning source repo..."
-          git clone --mirror ${{ inputs.source_repo_url }} repo-mirror
+          git clone --mirror https://x-access-token:${{ secrets.GH_PAT }}@github.com/$(echo "${{ inputs.source_repo_url }}" | sed 's/https:\/\/github.com\///') repo-mirror
           echo "✅ Mirror clone complete!"
 
       - name: Push Mirror to New Repository
