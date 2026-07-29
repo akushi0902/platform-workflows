@@ -89,7 +89,6 @@ jobs:
           SOURCE_OWNER=$(echo "${{ inputs.source_repo_url }}" | sed 's/.*github.com\///' | cut -d'/' -f1)
           SOURCE_REPO=$(echo "${{ inputs.source_repo_url }}" | sed 's/.*github.com\///' | cut -d'/' -f2 | sed 's/.git//')
           
-          # Get all branches
           BRANCHES=$(gh api repos/$SOURCE_OWNER/$SOURCE_REPO/branches --jq '.[].name')
           
           for BRANCH in $BRANCHES; do
