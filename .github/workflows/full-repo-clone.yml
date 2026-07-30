@@ -61,19 +61,19 @@ jobs:
     steps:
       - name: Install Dependencies
         run: |
-          echo "Installing required dependencies..."
+          echo "Installing dependencies..."
           sudo apt-get update
           sudo apt-get install -y jq
 
       - name: Validate Inputs
         run: |
           if [ -z "${{ inputs.new_repo_name }}" ]; then
-            echo "new_repo_name is required"
+            echo "ERROR: new_repo_name is required"
             exit 1
           fi
 
           if [ -z "${{ inputs.source_repo_url }}" ]; then
-            echo "source_repo_url is required"
+            echo "ERROR: source_repo_url is required"
             exit 1
           fi
 
@@ -85,20 +85,47 @@ jobs:
           SOURCE_URL="${SOURCE_URL%.git}"
           SOURCE_URL="${SOURCE_URL%/}"
 
-          SOURCE_PATH="${SOURCE_URL#https://github.com/}"
+          if echo "$SOURCE_URL" | grep -q "https://github.com/"; then
+            SOURCE_PATH="${SOURCE_URL#https://github.com/}"
+          else
+            echo "ERROR: source_repo_url must be in this format: https://github.com/owner/repo"
+            exit 1
+          fi
+
           SOURCE_OWNER="$(echo "$SOURCE_PATH" | cut -d '/' -f1)"
           SOURCE_REPO="$(echo "$SOURCE_PATH" | cut -d '/' -f2)"
 
-          echo "SOURCE_URL=$SOURCE_URL" >> $GITHUB_ENV
-          echo "SOURCE_PATH=$SOURCE_PATH" >> $GITHUB_ENV
-          echo "SOURCE_OWNER=$SOURCE_OWNER" >> $GITHUB_ENV
-          echo "SOURCE_REPO=$SOURCE_REPO" >> $GITHUB_ENV
-          echo "TARGET_REPO=${{ inputs.new_repo_name }}" >> $GITHUB_ENV
+          if [ -z "$SOURCE_OWNER" ] || [ -z "$SOURCE_REPO" ]; then
+            echo "ERROR: Could not parse source owner or source repo"
+            exit 1
+          fi
+
+          echo "SOURCE_URL=$SOURCE_URL" >> "$GITHUB_ENV"
+          echo "SOURCE_OWNER=$SOURCE_OWNER" >> "$GITHUB_ENV"
+          echo "SOURCE_REPO=$SOURCE_REPO" >> "$GITHUB_ENV"
+          echo "TARGET_REPO=${{ inputs.new_repo_name }}" >> "$GITHUB_ENV"
 
           echo "Source owner: $SOURCE_OWNER"
           echo "Source repo: $SOURCE_REPO"
           echo "Target owner: $ORG"
           echo "Target repo: ${{ inputs.new_repo_name }}"
+
+      - name: Fetch Source Branches
+        run: |
+          echo "Fetching source branches..."
+
+          gh api \
+            -H "Accept: application/vnd.github+json" \
+            "repos/$SOURCE_OWNER/$SOURCE_REPO/branches" \
+            --jq '.[].name' > source-branches.txt
+
+          if [ ! -s source-branches.txt ]; then
+            echo "ERROR: No branches found in source repository"
+            exit 1
+          fi
+
+          echo "Branches found:"
+          cat source-branches.txt
 
       - name: Fetch Source Branch Protection Rules
         if: ${{ inputs.copy_branch_protection == 'true' }}
@@ -107,23 +134,22 @@ jobs:
 
           mkdir -p branch-protections
 
-          gh api "repos/$SOURCE_OWNER/$SOURCE_REPO/branches" \
-            --jq '.[].name' > source-branches.txt
-
-          if [ ! -s source-branches.txt ]; then
-            echo "No branches found in source repository"
-            exit 1
-          fi
-
           while IFS= read -r BRANCH
           do
-            echo "Checking source protection for branch: $BRANCH"
+            echo "Checking protection for branch: $BRANCH"
+
+            BRANCH_KEY=$(printf '%s' "$BRANCH" | base64 | tr '/+' '_-' | tr -d '=')
 
             ENCODED_BRANCH=$(python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$BRANCH")
 
-            if gh api "repos/$SOURCE_OWNER/$SOURCE_REPO/branches/$ENCODED_BRANCH/protection" > "branch-protections/$BRANCH.raw.json" 2>/dev/null
+            if gh api \
+              -H "Accept: application/vnd.github+json" \
+              "repos/$SOURCE_OWNER/$SOURCE_REPO/branches/$ENCODED_BRANCH/protection" \
+              > "branch-protections/$BRANCH_KEY.raw.json" 2>/dev/null
             then
               echo "Protection found for branch: $BRANCH"
+
+              printf '%s\n' "$BRANCH" > "branch-protections/$BRANCH_KEY.branch"
 
               jq '
               {
@@ -201,10 +227,10 @@ jobs:
                 allow_fork_syncing:
                   (.allow_fork_syncing.enabled // false)
               }
-              ' "branch-protections/$BRANCH.raw.json" > "branch-protections/$BRANCH.clean.json"
+              ' "branch-protections/$BRANCH_KEY.raw.json" > "branch-protections/$BRANCH_KEY.clean.json"
 
             else
-              echo "No branch protection found for branch: $BRANCH"
+              echo "No protection configured for branch: $BRANCH"
             fi
           done < source-branches.txt
 
@@ -217,12 +243,14 @@ jobs:
 
           mkdir -p repo-rulesets
 
-          gh api "repos/$SOURCE_OWNER/$SOURCE_REPO/rulesets" \
-            -f includes_parents=false > repo-rulesets/rulesets-list.json
+          gh api \
+            -H "Accept: application/vnd.github+json" \
+            "repos/$SOURCE_OWNER/$SOURCE_REPO/rulesets?includes_parents=false" \
+            > repo-rulesets/rulesets-list.json
 
           RULESET_COUNT=$(jq 'length' repo-rulesets/rulesets-list.json)
 
-          echo "Repository rulesets found: $RULESET_COUNT"
+          echo "Repository-level rulesets found: $RULESET_COUNT"
 
           if [ "$RULESET_COUNT" -eq 0 ]; then
             echo "No repository-level rulesets found in source repository"
@@ -235,7 +263,9 @@ jobs:
           do
             echo "Fetching full ruleset details for ID: $RULESET_ID"
 
-            gh api "repos/$SOURCE_OWNER/$SOURCE_REPO/rulesets/$RULESET_ID" \
+            gh api \
+              -H "Accept: application/vnd.github+json" \
+              "repos/$SOURCE_OWNER/$SOURCE_REPO/rulesets/$RULESET_ID" \
               > "repo-rulesets/$RULESET_ID.raw.json"
 
             jq '
@@ -255,7 +285,7 @@ jobs:
 
       - name: Create New Repository
         run: |
-          echo "Creating new repository: $ORG/$TARGET_REPO"
+          echo "Creating target repository: $ORG/$TARGET_REPO"
 
           if gh repo view "$ORG/$TARGET_REPO" >/dev/null 2>&1
           then
@@ -304,7 +334,7 @@ jobs:
           echo "Applying branch protection rules to target repository..."
 
           if [ ! -d branch-protections ]; then
-            echo "No branch protection directory found"
+            echo "No branch protection data found"
             exit 0
           fi
 
@@ -312,12 +342,18 @@ jobs:
           FAILED_COUNT=0
           SKIPPED_COUNT=0
 
-          while IFS= read -r BRANCH
+          for CLEAN_FILE in branch-protections/*.clean.json
           do
-            CLEAN_FILE="branch-protections/$BRANCH.clean.json"
-
             if [ ! -f "$CLEAN_FILE" ]; then
-              echo "Skipping branch without protection: $BRANCH"
+              echo "No branch protection files found"
+              exit 0
+            fi
+
+            BRANCH_KEY=$(basename "$CLEAN_FILE" .clean.json)
+            BRANCH=$(cat "branch-protections/$BRANCH_KEY.branch")
+
+            if [ -z "$BRANCH" ]; then
+              echo "Skipping unknown branch for file: $CLEAN_FILE"
               SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
               continue
             fi
@@ -328,14 +364,15 @@ jobs:
 
             if gh api \
               --method PUT \
+              -H "Accept: application/vnd.github+json" \
               "repos/$ORG/$TARGET_REPO/branches/$ENCODED_BRANCH/protection" \
               --input "$CLEAN_FILE"
             then
-              echo "Applied protection to branch: $BRANCH"
+              echo "Applied full protection to branch: $BRANCH"
               APPLIED_COUNT=$((APPLIED_COUNT + 1))
             else
-              echo "Failed to apply full protection to branch: $BRANCH"
-              echo "Retrying without bypass and restriction sections..."
+              echo "Full protection failed for branch: $BRANCH"
+              echo "Retrying with simplified payload..."
 
               jq '
               del(
@@ -343,22 +380,44 @@ jobs:
                 .required_pull_request_reviews.dismissal_restrictions,
                 .restrictions
               )
-              ' "$CLEAN_FILE" > "branch-protections/$BRANCH.retry.json"
+              ' "$CLEAN_FILE" > "branch-protections/$BRANCH_KEY.retry1.json"
 
               if gh api \
                 --method PUT \
+                -H "Accept: application/vnd.github+json" \
                 "repos/$ORG/$TARGET_REPO/branches/$ENCODED_BRANCH/protection" \
-                --input "branch-protections/$BRANCH.retry.json"
+                --input "branch-protections/$BRANCH_KEY.retry1.json"
               then
                 echo "Applied simplified protection to branch: $BRANCH"
                 APPLIED_COUNT=$((APPLIED_COUNT + 1))
               else
-                echo "Protection still failed for branch: $BRANCH"
-                FAILED_COUNT=$((FAILED_COUNT + 1))
+                echo "Simplified protection failed for branch: $BRANCH"
+                echo "Retrying without required status checks..."
+
+                jq '
+                del(
+                  .required_pull_request_reviews.bypass_pull_request_allowances,
+                  .required_pull_request_reviews.dismissal_restrictions,
+                  .restrictions
+                )
+                | .required_status_checks = null
+                ' "$CLEAN_FILE" > "branch-protections/$BRANCH_KEY.retry2.json"
+
+                if gh api \
+                  --method PUT \
+                  -H "Accept: application/vnd.github+json" \
+                  "repos/$ORG/$TARGET_REPO/branches/$ENCODED_BRANCH/protection" \
+                  --input "branch-protections/$BRANCH_KEY.retry2.json"
+                then
+                  echo "Applied protection without status checks to branch: $BRANCH"
+                  APPLIED_COUNT=$((APPLIED_COUNT + 1))
+                else
+                  echo "Protection failed for branch: $BRANCH"
+                  FAILED_COUNT=$((FAILED_COUNT + 1))
+                fi
               fi
             fi
-
-          done < source-branches.txt
+          done
 
           echo "Branch protection apply summary"
           echo "Applied: $APPLIED_COUNT"
@@ -369,11 +428,6 @@ jobs:
         if: ${{ inputs.copy_rulesets == 'true' }}
         run: |
           echo "Applying repository rulesets to target repository..."
-
-          if [ ! -d repo-rulesets ]; then
-            echo "No ruleset directory found"
-            exit 0
-          fi
 
           if [ ! -f repo-rulesets/ruleset-ids.txt ]; then
             echo "No repository-level rulesets found to apply"
@@ -388,16 +442,18 @@ jobs:
             CLEAN_FILE="repo-rulesets/$RULESET_ID.clean.json"
 
             if [ ! -f "$CLEAN_FILE" ]; then
-              echo "Ruleset clean file not found for ID: $RULESET_ID"
+              echo "Ruleset clean file missing for ID: $RULESET_ID"
+              FAILED_RULESETS=$((FAILED_RULESETS + 1))
               continue
             fi
 
-            RULESET_NAME=$(jq -r '.name' "$CLEAN_FILE")
+            RULESET_NAME=$(jq -r '.name // "unknown-ruleset"' "$CLEAN_FILE")
 
             echo "Creating ruleset in target repository: $RULESET_NAME"
 
             if gh api \
               --method POST \
+              -H "Accept: application/vnd.github+json" \
               "repos/$ORG/$TARGET_REPO/rulesets" \
               --input "$CLEAN_FILE"
             then
@@ -405,16 +461,17 @@ jobs:
               APPLIED_RULESETS=$((APPLIED_RULESETS + 1))
             else
               echo "Ruleset creation failed for: $RULESET_NAME"
-              echo "Retrying ruleset without bypass actors..."
+              echo "Retrying without bypass actors..."
 
               jq '
               del(.bypass_actors)
-              ' "$CLEAN_FILE" > "repo-rulesets/$RULESET_ID.retry.json"
+              ' "$CLEAN_FILE" > "repo-rulesets/$RULESET_ID.retry1.json"
 
               if gh api \
                 --method POST \
+                -H "Accept: application/vnd.github+json" \
                 "repos/$ORG/$TARGET_REPO/rulesets" \
-                --input "repo-rulesets/$RULESET_ID.retry.json"
+                --input "repo-rulesets/$RULESET_ID.retry1.json"
               then
                 echo "Created ruleset without bypass actors: $RULESET_NAME"
                 APPLIED_RULESETS=$((APPLIED_RULESETS + 1))
