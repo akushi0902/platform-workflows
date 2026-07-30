@@ -27,13 +27,19 @@ on:
           - private
           - public
 
+      target_owner:
+        description: 'Target GitHub owner/org/user'
+        required: false
+        default: 'akushi0902'
+        type: string
+
       team_slug:
-        description: 'Team Slug (optional - for CODEOWNERS)'
+        description: 'Team Slug optional - only for org repos CODEOWNERS'
         required: false
         type: string
 
       copy_branch_protection:
-        description: 'Copy Branch Protection Rules'
+        description: 'Copy Classic Branch Protection Rules'
         required: false
         default: 'true'
         type: choice
@@ -56,7 +62,6 @@ jobs:
 
     env:
       GH_TOKEN: ${{ secrets.GH_PAT }}
-      ORG: akushi0902
 
     steps:
       - name: Install Dependencies
@@ -77,6 +82,11 @@ jobs:
             exit 1
           fi
 
+          if [ -z "${{ inputs.target_owner }}" ]; then
+            echo "ERROR: target_owner is required"
+            exit 1
+          fi
+
           echo "Inputs validated"
 
       - name: Prepare Repository Variables
@@ -88,27 +98,50 @@ jobs:
           if echo "$SOURCE_URL" | grep -q "https://github.com/"; then
             SOURCE_PATH="${SOURCE_URL#https://github.com/}"
           else
-            echo "ERROR: source_repo_url must be in this format: https://github.com/owner/repo"
+            echo "ERROR: source_repo_url must be like https://github.com/owner/repo"
             exit 1
           fi
 
           SOURCE_OWNER="$(echo "$SOURCE_PATH" | cut -d '/' -f1)"
           SOURCE_REPO="$(echo "$SOURCE_PATH" | cut -d '/' -f2)"
+          TARGET_OWNER="${{ inputs.target_owner }}"
+          TARGET_REPO="${{ inputs.new_repo_name }}"
 
           if [ -z "$SOURCE_OWNER" ] || [ -z "$SOURCE_REPO" ]; then
-            echo "ERROR: Could not parse source owner or source repo"
+            echo "ERROR: Could not parse source owner/repo"
             exit 1
           fi
 
           echo "SOURCE_URL=$SOURCE_URL" >> "$GITHUB_ENV"
           echo "SOURCE_OWNER=$SOURCE_OWNER" >> "$GITHUB_ENV"
           echo "SOURCE_REPO=$SOURCE_REPO" >> "$GITHUB_ENV"
-          echo "TARGET_REPO=${{ inputs.new_repo_name }}" >> "$GITHUB_ENV"
+          echo "TARGET_OWNER=$TARGET_OWNER" >> "$GITHUB_ENV"
+          echo "TARGET_REPO=$TARGET_REPO" >> "$GITHUB_ENV"
 
           echo "Source owner: $SOURCE_OWNER"
           echo "Source repo: $SOURCE_REPO"
-          echo "Target owner: $ORG"
-          echo "Target repo: ${{ inputs.new_repo_name }}"
+          echo "Target owner: $TARGET_OWNER"
+          echo "Target repo: $TARGET_REPO"
+
+      - name: Detect Target Owner Type
+        run: |
+          echo "Detecting target owner type..."
+
+          TARGET_OWNER_TYPE=$(gh api \
+            -H "Accept: application/vnd.github+json" \
+            "users/$TARGET_OWNER" \
+            --jq '.type')
+
+          if [ "$TARGET_OWNER_TYPE" = "Organization" ]; then
+            echo "Target owner is an Organization"
+            echo "TARGET_OWNER_TYPE=Organization" >> "$GITHUB_ENV"
+          elif [ "$TARGET_OWNER_TYPE" = "User" ]; then
+            echo "Target owner is a Personal User"
+            echo "TARGET_OWNER_TYPE=User" >> "$GITHUB_ENV"
+          else
+            echo "ERROR: Unsupported target owner type: $TARGET_OWNER_TYPE"
+            exit 1
+          fi
 
       - name: Fetch Source Branches
         run: |
@@ -127,18 +160,21 @@ jobs:
           echo "Branches found:"
           cat source-branches.txt
 
-      - name: Fetch Source Branch Protection Rules
+      - name: Fetch Source Classic Branch Protection Rules
         if: ${{ inputs.copy_branch_protection == 'true' }}
         run: |
-          echo "Fetching branch protection rules from source repository..."
+          echo "Fetching classic branch protection rules from source repository..."
 
           mkdir -p branch-protections
 
+          INDEX=0
+
           while IFS= read -r BRANCH
           do
-            echo "Checking protection for branch: $BRANCH"
+            INDEX=$((INDEX + 1))
+            BRANCH_KEY="branch_$INDEX"
 
-            BRANCH_KEY=$(printf '%s' "$BRANCH" | base64 | tr '/+' '_-' | tr -d '=')
+            echo "Checking protection for branch: $BRANCH"
 
             ENCODED_BRANCH=$(python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$BRANCH")
 
@@ -159,7 +195,17 @@ jobs:
                   then null
                   else {
                     strict: (.required_status_checks.strict // false),
-                    contexts: (.required_status_checks.contexts // [])
+                    contexts:
+                      (
+                        .required_status_checks.contexts
+                        //
+                        (
+                          (.required_status_checks.checks // [])
+                          | map(.context // .name // empty)
+                        )
+                        //
+                        []
+                      )
                   }
                   end
                 ),
@@ -172,11 +218,6 @@ jobs:
                   if .required_pull_request_reviews == null
                   then null
                   else {
-                    dismissal_restrictions: {
-                      users: ((.required_pull_request_reviews.dismissal_restrictions.users // []) | map(.login)),
-                      teams: ((.required_pull_request_reviews.dismissal_restrictions.teams // []) | map(.slug)),
-                      apps: ((.required_pull_request_reviews.dismissal_restrictions.apps // []) | map(.slug))
-                    },
                     dismiss_stale_reviews:
                       (.required_pull_request_reviews.dismiss_stale_reviews // false),
                     require_code_owner_reviews:
@@ -185,6 +226,11 @@ jobs:
                       (.required_pull_request_reviews.required_approving_review_count // 0),
                     require_last_push_approval:
                       (.required_pull_request_reviews.require_last_push_approval // false),
+                    dismissal_restrictions: {
+                      users: ((.required_pull_request_reviews.dismissal_restrictions.users // []) | map(.login)),
+                      teams: ((.required_pull_request_reviews.dismissal_restrictions.teams // []) | map(.slug)),
+                      apps: ((.required_pull_request_reviews.dismissal_restrictions.apps // []) | map(.slug))
+                    },
                     bypass_pull_request_allowances: {
                       users: ((.required_pull_request_reviews.bypass_pull_request_allowances.users // []) | map(.login)),
                       teams: ((.required_pull_request_reviews.bypass_pull_request_allowances.teams // []) | map(.slug)),
@@ -227,14 +273,29 @@ jobs:
                 allow_fork_syncing:
                   (.allow_fork_syncing.enabled // false)
               }
-              ' "branch-protections/$BRANCH_KEY.raw.json" > "branch-protections/$BRANCH_KEY.clean.json"
+              ' "branch-protections/$BRANCH_KEY.raw.json" > "branch-protections/$BRANCH_KEY.org.json"
+
+              jq '
+              .restrictions = null
+              |
+              if .required_pull_request_reviews != null
+              then
+                .required_pull_request_reviews |=
+                del(
+                  .dismissal_restrictions,
+                  .bypass_pull_request_allowances
+                )
+              else
+                .
+              end
+              ' "branch-protections/$BRANCH_KEY.org.json" > "branch-protections/$BRANCH_KEY.user.json"
 
             else
-              echo "No protection configured for branch: $BRANCH"
+              echo "No classic branch protection found for branch: $BRANCH"
             fi
           done < source-branches.txt
 
-          echo "Completed fetching branch protection rules"
+          echo "Completed fetching classic branch protection rules"
 
       - name: Fetch Source Repository Rulesets
         if: ${{ inputs.copy_rulesets == 'true' }}
@@ -277,7 +338,11 @@ jobs:
               conditions: (.conditions // {}),
               rules: (.rules // [])
             }
-            ' "repo-rulesets/$RULESET_ID.raw.json" > "repo-rulesets/$RULESET_ID.clean.json"
+            ' "repo-rulesets/$RULESET_ID.raw.json" > "repo-rulesets/$RULESET_ID.org.json"
+
+            jq '
+            .bypass_actors = []
+            ' "repo-rulesets/$RULESET_ID.org.json" > "repo-rulesets/$RULESET_ID.user.json"
 
           done < repo-rulesets/ruleset-ids.txt
 
@@ -285,24 +350,22 @@ jobs:
 
       - name: Create New Repository
         run: |
-          echo "Creating target repository: $ORG/$TARGET_REPO"
+          echo "Creating target repository: $TARGET_OWNER/$TARGET_REPO"
 
-          if gh repo view "$ORG/$TARGET_REPO" >/dev/null 2>&1
+          if gh repo view "$TARGET_OWNER/$TARGET_REPO" >/dev/null 2>&1
           then
-            echo "Repository already exists: $ORG/$TARGET_REPO"
+            echo "Repository already exists: $TARGET_OWNER/$TARGET_REPO"
           else
-            gh repo create "$ORG/$TARGET_REPO" \
+            gh repo create "$TARGET_OWNER/$TARGET_REPO" \
               --${{ inputs.visibility }}
 
-            echo "Repository created: $ORG/$TARGET_REPO"
+            echo "Repository created: $TARGET_OWNER/$TARGET_REPO"
           fi
 
       - name: Verify Target Repository Exists
         run: |
           echo "Verifying target repository..."
-
-          gh repo view "$ORG/$TARGET_REPO"
-
+          gh repo view "$TARGET_OWNER/$TARGET_REPO"
           echo "Target repository verified"
 
       - name: Mirror Clone Source Repository
@@ -322,16 +385,17 @@ jobs:
           cd repo-mirror
 
           git remote set-url origin \
-            "https://x-access-token:${{ secrets.GH_PAT }}@github.com/$ORG/$TARGET_REPO.git"
+            "https://x-access-token:${{ secrets.GH_PAT }}@github.com/$TARGET_OWNER/$TARGET_REPO.git"
 
           git push --mirror
 
           echo "Mirror push completed"
 
-      - name: Apply Branch Protection Rules To Target Repository
+      - name: Apply Classic Branch Protection Rules To Target Repository
         if: ${{ inputs.copy_branch_protection == 'true' }}
         run: |
-          echo "Applying branch protection rules to target repository..."
+          echo "Applying classic branch protection rules to target repository..."
+          echo "Target owner type: $TARGET_OWNER_TYPE"
 
           if [ ! -d branch-protections ]; then
             echo "No branch protection data found"
@@ -342,18 +406,30 @@ jobs:
           FAILED_COUNT=0
           SKIPPED_COUNT=0
 
-          for CLEAN_FILE in branch-protections/*.clean.json
+          for BRANCH_FILE in branch-protections/*.branch
           do
-            if [ ! -f "$CLEAN_FILE" ]; then
+            if [ ! -f "$BRANCH_FILE" ]; then
               echo "No branch protection files found"
               exit 0
             fi
 
-            BRANCH_KEY=$(basename "$CLEAN_FILE" .clean.json)
-            BRANCH=$(cat "branch-protections/$BRANCH_KEY.branch")
+            BRANCH_KEY=$(basename "$BRANCH_FILE" .branch)
+            BRANCH=$(cat "$BRANCH_FILE")
 
             if [ -z "$BRANCH" ]; then
-              echo "Skipping unknown branch for file: $CLEAN_FILE"
+              echo "Skipping empty branch file: $BRANCH_FILE"
+              SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
+              continue
+            fi
+
+            if [ "$TARGET_OWNER_TYPE" = "Organization" ]; then
+              PAYLOAD_FILE="branch-protections/$BRANCH_KEY.org.json"
+            else
+              PAYLOAD_FILE="branch-protections/$BRANCH_KEY.user.json"
+            fi
+
+            if [ ! -f "$PAYLOAD_FILE" ]; then
+              echo "Skipping branch without protection payload: $BRANCH"
               SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
               continue
             fi
@@ -365,49 +441,68 @@ jobs:
             if gh api \
               --method PUT \
               -H "Accept: application/vnd.github+json" \
-              "repos/$ORG/$TARGET_REPO/branches/$ENCODED_BRANCH/protection" \
-              --input "$CLEAN_FILE"
+              "repos/$TARGET_OWNER/$TARGET_REPO/branches/$ENCODED_BRANCH/protection" \
+              --input "$PAYLOAD_FILE"
             then
-              echo "Applied full protection to branch: $BRANCH"
+              echo "Applied protection to branch: $BRANCH"
               APPLIED_COUNT=$((APPLIED_COUNT + 1))
             else
               echo "Full protection failed for branch: $BRANCH"
-              echo "Retrying with simplified payload..."
+              echo "Retrying with personal-safe payload..."
+
+              SAFE_FILE="branch-protections/$BRANCH_KEY.personal-safe.json"
 
               jq '
-              del(
-                .required_pull_request_reviews.bypass_pull_request_allowances,
-                .required_pull_request_reviews.dismissal_restrictions,
-                .restrictions
-              )
-              ' "$CLEAN_FILE" > "branch-protections/$BRANCH_KEY.retry1.json"
+              .restrictions = null
+              |
+              if .required_pull_request_reviews != null
+              then
+                .required_pull_request_reviews |=
+                del(
+                  .dismissal_restrictions,
+                  .bypass_pull_request_allowances
+                )
+              else
+                .
+              end
+              ' "branch-protections/$BRANCH_KEY.org.json" > "$SAFE_FILE"
 
               if gh api \
                 --method PUT \
                 -H "Accept: application/vnd.github+json" \
-                "repos/$ORG/$TARGET_REPO/branches/$ENCODED_BRANCH/protection" \
-                --input "branch-protections/$BRANCH_KEY.retry1.json"
+                "repos/$TARGET_OWNER/$TARGET_REPO/branches/$ENCODED_BRANCH/protection" \
+                --input "$SAFE_FILE"
               then
-                echo "Applied simplified protection to branch: $BRANCH"
+                echo "Applied personal-safe protection to branch: $BRANCH"
                 APPLIED_COUNT=$((APPLIED_COUNT + 1))
               else
-                echo "Simplified protection failed for branch: $BRANCH"
+                echo "Personal-safe protection failed for branch: $BRANCH"
                 echo "Retrying without required status checks..."
 
+                SAFE_NO_CHECKS_FILE="branch-protections/$BRANCH_KEY.personal-safe-no-checks.json"
+
                 jq '
-                del(
-                  .required_pull_request_reviews.bypass_pull_request_allowances,
-                  .required_pull_request_reviews.dismissal_restrictions,
-                  .restrictions
-                )
-                | .required_status_checks = null
-                ' "$CLEAN_FILE" > "branch-protections/$BRANCH_KEY.retry2.json"
+                .restrictions = null
+                |
+                .required_status_checks = null
+                |
+                if .required_pull_request_reviews != null
+                then
+                  .required_pull_request_reviews |=
+                  del(
+                    .dismissal_restrictions,
+                    .bypass_pull_request_allowances
+                  )
+                else
+                  .
+                end
+                ' "branch-protections/$BRANCH_KEY.org.json" > "$SAFE_NO_CHECKS_FILE"
 
                 if gh api \
                   --method PUT \
                   -H "Accept: application/vnd.github+json" \
-                  "repos/$ORG/$TARGET_REPO/branches/$ENCODED_BRANCH/protection" \
-                  --input "branch-protections/$BRANCH_KEY.retry2.json"
+                  "repos/$TARGET_OWNER/$TARGET_REPO/branches/$ENCODED_BRANCH/protection" \
+                  --input "$SAFE_NO_CHECKS_FILE"
                 then
                   echo "Applied protection without status checks to branch: $BRANCH"
                   APPLIED_COUNT=$((APPLIED_COUNT + 1))
@@ -419,15 +514,20 @@ jobs:
             fi
           done
 
-          echo "Branch protection apply summary"
+          echo "Classic branch protection apply summary"
           echo "Applied: $APPLIED_COUNT"
           echo "Skipped: $SKIPPED_COUNT"
           echo "Failed: $FAILED_COUNT"
+
+          if [ "$FAILED_COUNT" -gt 0 ]; then
+            echo "WARNING: Some branch protection rules failed to apply"
+          fi
 
       - name: Apply Repository Rulesets To Target Repository
         if: ${{ inputs.copy_rulesets == 'true' }}
         run: |
           echo "Applying repository rulesets to target repository..."
+          echo "Target owner type: $TARGET_OWNER_TYPE"
 
           if [ ! -f repo-rulesets/ruleset-ids.txt ]; then
             echo "No repository-level rulesets found to apply"
@@ -439,10 +539,14 @@ jobs:
 
           while IFS= read -r RULESET_ID
           do
-            CLEAN_FILE="repo-rulesets/$RULESET_ID.clean.json"
+            if [ "$TARGET_OWNER_TYPE" = "Organization" ]; then
+              CLEAN_FILE="repo-rulesets/$RULESET_ID.org.json"
+            else
+              CLEAN_FILE="repo-rulesets/$RULESET_ID.user.json"
+            fi
 
             if [ ! -f "$CLEAN_FILE" ]; then
-              echo "Ruleset clean file missing for ID: $RULESET_ID"
+              echo "Ruleset file missing for ID: $RULESET_ID"
               FAILED_RULESETS=$((FAILED_RULESETS + 1))
               continue
             fi
@@ -454,7 +558,7 @@ jobs:
             if gh api \
               --method POST \
               -H "Accept: application/vnd.github+json" \
-              "repos/$ORG/$TARGET_REPO/rulesets" \
+              "repos/$TARGET_OWNER/$TARGET_REPO/rulesets" \
               --input "$CLEAN_FILE"
             then
               echo "Created ruleset: $RULESET_NAME"
@@ -463,15 +567,17 @@ jobs:
               echo "Ruleset creation failed for: $RULESET_NAME"
               echo "Retrying without bypass actors..."
 
+              RETRY_FILE="repo-rulesets/$RULESET_ID.retry-no-bypass.json"
+
               jq '
-              del(.bypass_actors)
-              ' "$CLEAN_FILE" > "repo-rulesets/$RULESET_ID.retry1.json"
+              .bypass_actors = []
+              ' "$CLEAN_FILE" > "$RETRY_FILE"
 
               if gh api \
                 --method POST \
                 -H "Accept: application/vnd.github+json" \
-                "repos/$ORG/$TARGET_REPO/rulesets" \
-                --input "repo-rulesets/$RULESET_ID.retry1.json"
+                "repos/$TARGET_OWNER/$TARGET_REPO/rulesets" \
+                --input "$RETRY_FILE"
               then
                 echo "Created ruleset without bypass actors: $RULESET_NAME"
                 APPLIED_RULESETS=$((APPLIED_RULESETS + 1))
@@ -487,20 +593,29 @@ jobs:
           echo "Applied: $APPLIED_RULESETS"
           echo "Failed: $FAILED_RULESETS"
 
+          if [ "$FAILED_RULESETS" -gt 0 ]; then
+            echo "WARNING: Some rulesets failed to apply"
+          fi
+
       - name: Setup CODEOWNERS
         if: ${{ inputs.team_slug != '' }}
         run: |
           echo "Setting up CODEOWNERS..."
 
+          if [ "$TARGET_OWNER_TYPE" != "Organization" ]; then
+            echo "Skipping CODEOWNERS team entry because target owner is personal user"
+            exit 0
+          fi
+
           git clone \
-            "https://x-access-token:${{ secrets.GH_PAT }}@github.com/$ORG/$TARGET_REPO.git" \
+            "https://x-access-token:${{ secrets.GH_PAT }}@github.com/$TARGET_OWNER/$TARGET_REPO.git" \
             codeowners-repo
 
           cd codeowners-repo
 
           mkdir -p .github
 
-          echo "* @$ORG/${{ inputs.team_slug }}" > .github/CODEOWNERS
+          echo "* @$TARGET_OWNER/${{ inputs.team_slug }}" > .github/CODEOWNERS
 
           git config user.email "actions@github.com"
           git config user.name "GitHub Actions"
@@ -513,6 +628,38 @@ jobs:
 
           echo "CODEOWNERS setup completed"
 
+      - name: Verify Applied Classic Branch Protections
+        if: ${{ inputs.copy_branch_protection == 'true' }}
+        run: |
+          echo "Verifying applied classic branch protections..."
+
+          if [ ! -d branch-protections ]; then
+            echo "No branch protection data found"
+            exit 0
+          fi
+
+          for BRANCH_FILE in branch-protections/*.branch
+          do
+            if [ ! -f "$BRANCH_FILE" ]; then
+              echo "No branch protection files found"
+              exit 0
+            fi
+
+            BRANCH=$(cat "$BRANCH_FILE")
+            ENCODED_BRANCH=$(python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$BRANCH")
+
+            echo "Checking target protection for branch: $BRANCH"
+
+            if gh api \
+              -H "Accept: application/vnd.github+json" \
+              "repos/$TARGET_OWNER/$TARGET_REPO/branches/$ENCODED_BRANCH/protection" >/dev/null 2>&1
+            then
+              echo "Verified protection exists for branch: $BRANCH"
+            else
+              echo "Protection not found for branch: $BRANCH"
+            fi
+          done
+
       - name: Final Summary
         run: |
           echo "Repository clone workflow completed"
@@ -521,15 +668,18 @@ jobs:
           echo "https://github.com/$SOURCE_OWNER/$SOURCE_REPO"
           echo ""
           echo "Target Repository:"
-          echo "https://github.com/$ORG/$TARGET_REPO"
+          echo "https://github.com/$TARGET_OWNER/$TARGET_REPO"
+          echo ""
+          echo "Target Owner Type:"
+          echo "$TARGET_OWNER_TYPE"
           echo ""
           echo "Visibility:"
           echo "${{ inputs.visibility }}"
           echo ""
-          echo "Branch Protection Copy:"
+          echo "Classic Branch Protection Copy:"
           echo "${{ inputs.copy_branch_protection }}"
           echo ""
-          echo "Ruleset Copy:"
+          echo "Repository Ruleset Copy:"
           echo "${{ inputs.copy_rulesets }}"
           echo ""
           echo "CODEOWNERS Team:"
