@@ -59,206 +59,384 @@ jobs:
       ORG: akushi0902
 
     steps:
-
       - name: Install Dependencies
         run: |
+          echo "Installing required dependencies..."
           sudo apt-get update
           sudo apt-get install -y jq
 
       - name: Validate Inputs
         run: |
           if [ -z "${{ inputs.new_repo_name }}" ]; then
-            echo "❌ new_repo_name is required!"
+            echo "new_repo_name is required"
             exit 1
           fi
 
           if [ -z "${{ inputs.source_repo_url }}" ]; then
-            echo "❌ source_repo_url is required!"
+            echo "source_repo_url is required"
             exit 1
           fi
 
-          echo "✅ Inputs validated"
+          echo "Inputs validated"
+
+      - name: Prepare Repository Variables
+        run: |
+          SOURCE_URL="${{ inputs.source_repo_url }}"
+          SOURCE_URL="${SOURCE_URL%.git}"
+          SOURCE_URL="${SOURCE_URL%/}"
+
+          SOURCE_PATH="${SOURCE_URL#https://github.com/}"
+          SOURCE_OWNER="$(echo "$SOURCE_PATH" | cut -d '/' -f1)"
+          SOURCE_REPO="$(echo "$SOURCE_PATH" | cut -d '/' -f2)"
+
+          echo "SOURCE_URL=$SOURCE_URL" >> $GITHUB_ENV
+          echo "SOURCE_PATH=$SOURCE_PATH" >> $GITHUB_ENV
+          echo "SOURCE_OWNER=$SOURCE_OWNER" >> $GITHUB_ENV
+          echo "SOURCE_REPO=$SOURCE_REPO" >> $GITHUB_ENV
+          echo "TARGET_REPO=${{ inputs.new_repo_name }}" >> $GITHUB_ENV
+
+          echo "Source owner: $SOURCE_OWNER"
+          echo "Source repo: $SOURCE_REPO"
+          echo "Target owner: $ORG"
+          echo "Target repo: ${{ inputs.new_repo_name }}"
+
+      - name: Fetch Source Branch Protection Rules
+        if: ${{ inputs.copy_branch_protection == 'true' }}
+        run: |
+          echo "Fetching branch protection rules from source repository..."
+
+          mkdir -p branch-protections
+
+          gh api "repos/$SOURCE_OWNER/$SOURCE_REPO/branches" \
+            --jq '.[].name' > source-branches.txt
+
+          if [ ! -s source-branches.txt ]; then
+            echo "No branches found in source repository"
+            exit 1
+          fi
+
+          while IFS= read -r BRANCH
+          do
+            echo "Checking source protection for branch: $BRANCH"
+
+            ENCODED_BRANCH=$(python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$BRANCH")
+
+            if gh api "repos/$SOURCE_OWNER/$SOURCE_REPO/branches/$ENCODED_BRANCH/protection" > "branch-protections/$BRANCH.raw.json" 2>/dev/null
+            then
+              echo "Protection found for branch: $BRANCH"
+
+              jq '
+              {
+                required_status_checks:
+                (
+                  if .required_status_checks == null
+                  then null
+                  else {
+                    strict: (.required_status_checks.strict // false),
+                    contexts: (.required_status_checks.contexts // [])
+                  }
+                  end
+                ),
+
+                enforce_admins:
+                  (.enforce_admins.enabled // false),
+
+                required_pull_request_reviews:
+                (
+                  if .required_pull_request_reviews == null
+                  then null
+                  else {
+                    dismissal_restrictions: {
+                      users: ((.required_pull_request_reviews.dismissal_restrictions.users // []) | map(.login)),
+                      teams: ((.required_pull_request_reviews.dismissal_restrictions.teams // []) | map(.slug)),
+                      apps: ((.required_pull_request_reviews.dismissal_restrictions.apps // []) | map(.slug))
+                    },
+                    dismiss_stale_reviews:
+                      (.required_pull_request_reviews.dismiss_stale_reviews // false),
+                    require_code_owner_reviews:
+                      (.required_pull_request_reviews.require_code_owner_reviews // false),
+                    required_approving_review_count:
+                      (.required_pull_request_reviews.required_approving_review_count // 0),
+                    require_last_push_approval:
+                      (.required_pull_request_reviews.require_last_push_approval // false),
+                    bypass_pull_request_allowances: {
+                      users: ((.required_pull_request_reviews.bypass_pull_request_allowances.users // []) | map(.login)),
+                      teams: ((.required_pull_request_reviews.bypass_pull_request_allowances.teams // []) | map(.slug)),
+                      apps: ((.required_pull_request_reviews.bypass_pull_request_allowances.apps // []) | map(.slug))
+                    }
+                  }
+                  end
+                ),
+
+                restrictions:
+                (
+                  if .restrictions == null
+                  then null
+                  else {
+                    users: ((.restrictions.users // []) | map(.login)),
+                    teams: ((.restrictions.teams // []) | map(.slug)),
+                    apps: ((.restrictions.apps // []) | map(.slug))
+                  }
+                  end
+                ),
+
+                required_linear_history:
+                  (.required_linear_history.enabled // false),
+
+                allow_force_pushes:
+                  (.allow_force_pushes.enabled // false),
+
+                allow_deletions:
+                  (.allow_deletions.enabled // false),
+
+                block_creations:
+                  (.block_creations.enabled // false),
+
+                required_conversation_resolution:
+                  (.required_conversation_resolution.enabled // false),
+
+                lock_branch:
+                  (.lock_branch.enabled // false),
+
+                allow_fork_syncing:
+                  (.allow_fork_syncing.enabled // false)
+              }
+              ' "branch-protections/$BRANCH.raw.json" > "branch-protections/$BRANCH.clean.json"
+
+            else
+              echo "No branch protection found for branch: $BRANCH"
+            fi
+          done < source-branches.txt
+
+          echo "Completed fetching branch protection rules"
+
+      - name: Fetch Source Repository Rulesets
+        if: ${{ inputs.copy_rulesets == 'true' }}
+        run: |
+          echo "Fetching repository rulesets from source repository..."
+
+          mkdir -p repo-rulesets
+
+          gh api "repos/$SOURCE_OWNER/$SOURCE_REPO/rulesets" \
+            -f includes_parents=false > repo-rulesets/rulesets-list.json
+
+          RULESET_COUNT=$(jq 'length' repo-rulesets/rulesets-list.json)
+
+          echo "Repository rulesets found: $RULESET_COUNT"
+
+          if [ "$RULESET_COUNT" -eq 0 ]; then
+            echo "No repository-level rulesets found in source repository"
+            exit 0
+          fi
+
+          jq -r '.[].id' repo-rulesets/rulesets-list.json > repo-rulesets/ruleset-ids.txt
+
+          while IFS= read -r RULESET_ID
+          do
+            echo "Fetching full ruleset details for ID: $RULESET_ID"
+
+            gh api "repos/$SOURCE_OWNER/$SOURCE_REPO/rulesets/$RULESET_ID" \
+              > "repo-rulesets/$RULESET_ID.raw.json"
+
+            jq '
+            {
+              name: .name,
+              target: .target,
+              enforcement: .enforcement,
+              bypass_actors: (.bypass_actors // []),
+              conditions: (.conditions // {}),
+              rules: (.rules // [])
+            }
+            ' "repo-rulesets/$RULESET_ID.raw.json" > "repo-rulesets/$RULESET_ID.clean.json"
+
+          done < repo-rulesets/ruleset-ids.txt
+
+          echo "Completed fetching repository rulesets"
 
       - name: Create New Repository
         run: |
-          echo "📦 Creating repo..."
+          echo "Creating new repository: $ORG/$TARGET_REPO"
 
-          gh repo create "${{ inputs.new_repo_name }}" \
-            --${{ inputs.visibility }}
+          if gh repo view "$ORG/$TARGET_REPO" >/dev/null 2>&1
+          then
+            echo "Repository already exists: $ORG/$TARGET_REPO"
+          else
+            gh repo create "$ORG/$TARGET_REPO" \
+              --${{ inputs.visibility }}
 
-          echo "✅ Repository created"
+            echo "Repository created: $ORG/$TARGET_REPO"
+          fi
 
-      - name: Verify Repository Exists
+      - name: Verify Target Repository Exists
         run: |
-          echo "🔍 Verifying repository..."
+          echo "Verifying target repository..."
 
-          sleep 5
+          gh repo view "$ORG/$TARGET_REPO"
 
-          gh repo view "$ORG/${{ inputs.new_repo_name }}" \
-            || exit 1
-
-          echo "✅ Repository confirmed"
+          echo "Target repository verified"
 
       - name: Mirror Clone Source Repository
         run: |
-          echo "🔄 Cloning source repository..."
-
-          SOURCE_PATH=$(echo "${{ inputs.source_repo_url }}" | sed 's#https://github.com/##')
+          echo "Mirror cloning source repository..."
 
           git clone --mirror \
-            https://x-access-token:${{ secrets.GH_PAT }}@github.com/${SOURCE_PATH} \
+            "https://x-access-token:${{ secrets.GH_PAT }}@github.com/$SOURCE_OWNER/$SOURCE_REPO.git" \
             repo-mirror
 
-          echo "✅ Mirror clone complete"
+          echo "Mirror clone completed"
 
-      - name: Push Mirror To Destination Repository
+      - name: Push Mirror To Target Repository
         run: |
-          echo "🚀 Pushing repository..."
+          echo "Pushing mirror to target repository..."
 
           cd repo-mirror
 
           git remote set-url origin \
-            https://x-access-token:${{ secrets.GH_PAT }}@github.com/$ORG/${{ inputs.new_repo_name }}.git
+            "https://x-access-token:${{ secrets.GH_PAT }}@github.com/$ORG/$TARGET_REPO.git"
 
           git push --mirror
 
-          echo "✅ Mirror push complete"
+          echo "Mirror push completed"
 
-      - name: Copy Branch Protection Rules
+      - name: Apply Branch Protection Rules To Target Repository
         if: ${{ inputs.copy_branch_protection == 'true' }}
         run: |
-          echo "🔒 Copying branch protection rules..."
+          echo "Applying branch protection rules to target repository..."
 
-          SOURCE_OWNER=$(echo "${{ inputs.source_repo_url }}" \
-            | sed 's#https://github.com/##' \
-            | cut -d'/' -f1)
+          if [ ! -d branch-protections ]; then
+            echo "No branch protection directory found"
+            exit 0
+          fi
 
-          SOURCE_REPO=$(echo "${{ inputs.source_repo_url }}" \
-            | sed 's#https://github.com/##' \
-            | cut -d'/' -f2 \
-            | sed 's/.git//')
+          APPLIED_COUNT=0
+          FAILED_COUNT=0
+          SKIPPED_COUNT=0
 
-          BRANCHES=$(gh api repos/$SOURCE_OWNER/$SOURCE_REPO/branches --jq '.[].name')
-
-          for BRANCH in $BRANCHES
+          while IFS= read -r BRANCH
           do
-            echo "Processing $BRANCH"
+            CLEAN_FILE="branch-protections/$BRANCH.clean.json"
 
-            gh api \
-            repos/$SOURCE_OWNER/$SOURCE_REPO/branches/$BRANCH/protection \
-            > protection.json 2>/dev/null || continue
+            if [ ! -f "$CLEAN_FILE" ]; then
+              echo "Skipping branch without protection: $BRANCH"
+              SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
+              continue
+            fi
 
-            jq '
-            {
-              required_status_checks:
-              (
-                if .required_status_checks == null
-                then null
-                else {
-                  strict: .required_status_checks.strict,
-                  checks: (.required_status_checks.checks // [])
-                }
-                end
-              ),
+            echo "Applying protection to target branch: $BRANCH"
 
-              enforce_admins:
-                (.enforce_admins.enabled // false),
+            ENCODED_BRANCH=$(python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$BRANCH")
 
-              required_pull_request_reviews:
-              (
-                if .required_pull_request_reviews == null
-                then null
-                else {
-                  dismiss_stale_reviews:
-                  .required_pull_request_reviews.dismiss_stale_reviews,
-
-                  require_code_owner_reviews:
-                  .required_pull_request_reviews.require_code_owner_reviews,
-
-                  required_approving_review_count:
-                  .required_pull_request_reviews.required_approving_review_count
-                }
-                end
-              ),
-
-              restrictions: null,
-
-              required_linear_history:
-                (.required_linear_history.enabled // false),
-
-              allow_force_pushes:
-                (.allow_force_pushes.enabled // false),
-
-              allow_deletions:
-                (.allow_deletions.enabled // false),
-
-              block_creations:
-                (.block_creations.enabled // false),
-
-              required_conversation_resolution:
-                (.required_conversation_resolution.enabled // false)
-            }
-            ' protection.json > clean-protection.json
-
-            gh api \
+            if gh api \
               --method PUT \
-              repos/$ORG/${{ inputs.new_repo_name }}/branches/$BRANCH/protection \
-              --input clean-protection.json \
-              || echo "⚠️ Protection copy failed for $BRANCH"
-          done
+              "repos/$ORG/$TARGET_REPO/branches/$ENCODED_BRANCH/protection" \
+              --input "$CLEAN_FILE"
+            then
+              echo "Applied protection to branch: $BRANCH"
+              APPLIED_COUNT=$((APPLIED_COUNT + 1))
+            else
+              echo "Failed to apply full protection to branch: $BRANCH"
+              echo "Retrying without bypass and restriction sections..."
 
-          echo "✅ Branch protections copied"
+              jq '
+              del(
+                .required_pull_request_reviews.bypass_pull_request_allowances,
+                .required_pull_request_reviews.dismissal_restrictions,
+                .restrictions
+              )
+              ' "$CLEAN_FILE" > "branch-protections/$BRANCH.retry.json"
 
-      - name: Copy Repository Rulesets
+              if gh api \
+                --method PUT \
+                "repos/$ORG/$TARGET_REPO/branches/$ENCODED_BRANCH/protection" \
+                --input "branch-protections/$BRANCH.retry.json"
+              then
+                echo "Applied simplified protection to branch: $BRANCH"
+                APPLIED_COUNT=$((APPLIED_COUNT + 1))
+              else
+                echo "Protection still failed for branch: $BRANCH"
+                FAILED_COUNT=$((FAILED_COUNT + 1))
+              fi
+            fi
+
+          done < source-branches.txt
+
+          echo "Branch protection apply summary"
+          echo "Applied: $APPLIED_COUNT"
+          echo "Skipped: $SKIPPED_COUNT"
+          echo "Failed: $FAILED_COUNT"
+
+      - name: Apply Repository Rulesets To Target Repository
         if: ${{ inputs.copy_rulesets == 'true' }}
         run: |
-          echo "📋 Copying rulesets..."
+          echo "Applying repository rulesets to target repository..."
 
-          SOURCE_OWNER=$(echo "${{ inputs.source_repo_url }}" \
-            | sed 's#https://github.com/##' \
-            | cut -d'/' -f1)
+          if [ ! -d repo-rulesets ]; then
+            echo "No ruleset directory found"
+            exit 0
+          fi
 
-          SOURCE_REPO=$(echo "${{ inputs.source_repo_url }}" \
-            | sed 's#https://github.com/##' \
-            | cut -d'/' -f2 \
-            | sed 's/.git//')
+          if [ ! -f repo-rulesets/ruleset-ids.txt ]; then
+            echo "No repository-level rulesets found to apply"
+            exit 0
+          fi
 
-          gh api \
-            repos/$SOURCE_OWNER/$SOURCE_REPO/rulesets \
-            > rulesets.json
+          APPLIED_RULESETS=0
+          FAILED_RULESETS=0
 
-          jq -c '.[]' rulesets.json | while read RULESET
+          while IFS= read -r RULESET_ID
           do
+            CLEAN_FILE="repo-rulesets/$RULESET_ID.clean.json"
 
-            echo "$RULESET" | jq '
-            del(
-              .id,
-              .node_id,
-              .source,
-              .source_type,
-              .url,
-              ._links,
-              .created_at,
-              .updated_at
-            )
-            ' > clean-ruleset.json
+            if [ ! -f "$CLEAN_FILE" ]; then
+              echo "Ruleset clean file not found for ID: $RULESET_ID"
+              continue
+            fi
 
-            gh api \
+            RULESET_NAME=$(jq -r '.name' "$CLEAN_FILE")
+
+            echo "Creating ruleset in target repository: $RULESET_NAME"
+
+            if gh api \
               --method POST \
-              repos/$ORG/${{ inputs.new_repo_name }}/rulesets \
-              --input clean-ruleset.json \
-              || echo "⚠️ Ruleset copy failed"
-          done
+              "repos/$ORG/$TARGET_REPO/rulesets" \
+              --input "$CLEAN_FILE"
+            then
+              echo "Created ruleset: $RULESET_NAME"
+              APPLIED_RULESETS=$((APPLIED_RULESETS + 1))
+            else
+              echo "Ruleset creation failed for: $RULESET_NAME"
+              echo "Retrying ruleset without bypass actors..."
 
-          echo "✅ Rulesets copied"
+              jq '
+              del(.bypass_actors)
+              ' "$CLEAN_FILE" > "repo-rulesets/$RULESET_ID.retry.json"
+
+              if gh api \
+                --method POST \
+                "repos/$ORG/$TARGET_REPO/rulesets" \
+                --input "repo-rulesets/$RULESET_ID.retry.json"
+              then
+                echo "Created ruleset without bypass actors: $RULESET_NAME"
+                APPLIED_RULESETS=$((APPLIED_RULESETS + 1))
+              else
+                echo "Ruleset still failed: $RULESET_NAME"
+                FAILED_RULESETS=$((FAILED_RULESETS + 1))
+              fi
+            fi
+
+          done < repo-rulesets/ruleset-ids.txt
+
+          echo "Ruleset apply summary"
+          echo "Applied: $APPLIED_RULESETS"
+          echo "Failed: $FAILED_RULESETS"
 
       - name: Setup CODEOWNERS
         if: ${{ inputs.team_slug != '' }}
         run: |
-          echo "👥 Creating CODEOWNERS..."
+          echo "Setting up CODEOWNERS..."
 
           git clone \
-            https://x-access-token:${{ secrets.GH_PAT }}@github.com/$ORG/${{ inputs.new_repo_name }}.git \
+            "https://x-access-token:${{ secrets.GH_PAT }}@github.com/$ORG/$TARGET_REPO.git" \
             codeowners-repo
 
           cd codeowners-repo
@@ -272,33 +450,31 @@ jobs:
 
           git add .github/CODEOWNERS
 
-          git commit -m "chore: add CODEOWNERS file" || true
+          git commit -m "chore: add CODEOWNERS file" || echo "Nothing to commit"
 
           git push
 
-          echo "✅ CODEOWNERS created"
+          echo "CODEOWNERS setup completed"
 
-      - name: Summary
+      - name: Final Summary
         run: |
-          echo "🎉 Repository clone complete"
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-
+          echo "Repository clone workflow completed"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
           echo "Source Repository:"
-          echo "${{ inputs.source_repo_url }}"
-
-          echo "Destination Repository:"
-          echo "https://github.com/$ORG/${{ inputs.new_repo_name }}"
-
+          echo "https://github.com/$SOURCE_OWNER/$SOURCE_REPO"
+          echo ""
+          echo "Target Repository:"
+          echo "https://github.com/$ORG/$TARGET_REPO"
+          echo ""
           echo "Visibility:"
           echo "${{ inputs.visibility }}"
-
-          echo "Branch Protection:"
+          echo ""
+          echo "Branch Protection Copy:"
           echo "${{ inputs.copy_branch_protection }}"
-
-          echo "Rulesets:"
+          echo ""
+          echo "Ruleset Copy:"
           echo "${{ inputs.copy_rulesets }}"
-
+          echo ""
           echo "CODEOWNERS Team:"
           echo "${{ inputs.team_slug }}"
-
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
