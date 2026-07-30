@@ -1,4 +1,4 @@
-name: Full Repository Clone - Files, Branches, Rules & Branch Protection
+name: Full Repository Clone - Files, Branches, Rulesets and Branch Protection
 
 permissions:
   contents: write
@@ -9,68 +9,93 @@ on:
   workflow_dispatch:
     inputs:
       new_repo_name:
-        description: 'New Repository Name'
+        description: "New repository name"
         required: true
         type: string
 
       source_repo_url:
-        description: 'Source Repository URL'
+        description: "Source repository URL"
+        required: true
+        type: string
+
+      target_profile_url:
+        description: "Target GitHub user/org profile URL"
+        required: true
+        type: string
+
+      target_pat:
+        description: "Target GitHub user/org PAT"
         required: true
         type: string
 
       visibility:
-        description: 'Repository Visibility'
+        description: "Target repository visibility"
         required: false
-        default: 'private'
+        default: "private"
         type: choice
         options:
           - private
           - public
 
-      target_owner:
-        description: 'Target GitHub owner/org/user'
+      team_slug:
+        description: "Team slug optional, only for org repos CODEOWNERS"
         required: false
-        default: 'akushi0902'
+        default: ""
         type: string
 
-      team_slug:
-        description: 'Team Slug optional - only for org repos CODEOWNERS'
+      setup_codeowners:
+        description: "Create CODEOWNERS file for org team"
         required: false
-        type: string
+        default: "false"
+        type: choice
+        options:
+          - "true"
+          - "false"
 
       copy_branch_protection:
-        description: 'Copy Classic Branch Protection Rules'
+        description: "Copy classic branch protection rules"
         required: false
-        default: 'true'
+        default: "true"
         type: choice
         options:
-          - 'true'
-          - 'false'
+          - "true"
+          - "false"
 
       copy_rulesets:
-        description: 'Copy Repository Rulesets'
+        description: "Copy repository rulesets"
         required: false
-        default: 'true'
+        default: "true"
         type: choice
         options:
-          - 'true'
-          - 'false'
+          - "true"
+          - "false"
 
 jobs:
   clone-repo:
     runs-on: ubuntu-latest
 
     env:
-      GH_TOKEN: ${{ secrets.GH_PAT }}
+      SOURCE_PAT: ${{ secrets.GH_PAT }}
+      TARGET_PAT: ${{ inputs.target_pat }}
 
     steps:
+      - name: Mask Tokens
+        run: |
+          echo "::add-mask::${SOURCE_PAT}"
+          echo "::add-mask::${TARGET_PAT}"
+          echo "Tokens masked"
+
       - name: Install Dependencies
         run: |
           echo "Installing dependencies..."
           sudo apt-get update
           sudo apt-get install -y jq
 
-      - name: Validate Inputs
+          gh --version
+          git --version
+          jq --version
+
+      - name: Validate Inputs And Tokens
         run: |
           if [ -z "${{ inputs.new_repo_name }}" ]; then
             echo "ERROR: new_repo_name is required"
@@ -82,75 +107,200 @@ jobs:
             exit 1
           fi
 
-          if [ -z "${{ inputs.target_owner }}" ]; then
-            echo "ERROR: target_owner is required"
+          if [ -z "${{ inputs.target_profile_url }}" ]; then
+            echo "ERROR: target_profile_url is required"
             exit 1
           fi
 
-          echo "Inputs validated"
+          if [ -z "$SOURCE_PAT" ]; then
+            echo "ERROR: GH_PAT repository secret is missing"
+            exit 1
+          fi
+
+          if [ -z "$TARGET_PAT" ]; then
+            echo "ERROR: target_pat input is required"
+            exit 1
+          fi
+
+          echo "Inputs and tokens validated"
 
       - name: Prepare Repository Variables
         run: |
+          echo "Preparing repository variables..."
+
           SOURCE_URL="${{ inputs.source_repo_url }}"
           SOURCE_URL="${SOURCE_URL%.git}"
           SOURCE_URL="${SOURCE_URL%/}"
 
-          if echo "$SOURCE_URL" | grep -q "https://github.com/"; then
+          if echo "$SOURCE_URL" | grep -q "^https://github.com/"; then
             SOURCE_PATH="${SOURCE_URL#https://github.com/}"
           else
-            echo "ERROR: source_repo_url must be like https://github.com/owner/repo"
+            echo "ERROR: source_repo_url must be like https://github.com/source-owner/source-repo"
             exit 1
           fi
 
           SOURCE_OWNER="$(echo "$SOURCE_PATH" | cut -d '/' -f1)"
           SOURCE_REPO="$(echo "$SOURCE_PATH" | cut -d '/' -f2)"
-          TARGET_OWNER="${{ inputs.target_owner }}"
-          TARGET_REPO="${{ inputs.new_repo_name }}"
 
           if [ -z "$SOURCE_OWNER" ] || [ -z "$SOURCE_REPO" ]; then
             echo "ERROR: Could not parse source owner/repo"
             exit 1
           fi
 
+          TARGET_PROFILE_URL="${{ inputs.target_profile_url }}"
+          TARGET_PROFILE_URL="${TARGET_PROFILE_URL%.git}"
+          TARGET_PROFILE_URL="${TARGET_PROFILE_URL%/}"
+
+          if echo "$TARGET_PROFILE_URL" | grep -q "^https://github.com/"; then
+            TARGET_PATH="${TARGET_PROFILE_URL#https://github.com/}"
+          else
+            echo "ERROR: target_profile_url must be like https://github.com/target-user-or-org"
+            exit 1
+          fi
+
+          TARGET_ACCOUNT="$(echo "$TARGET_PATH" | cut -d '/' -f1)"
+          TARGET_REPO="${{ inputs.new_repo_name }}"
+
+          if [ -z "$TARGET_ACCOUNT" ]; then
+            echo "ERROR: Could not parse target user/org from target_profile_url"
+            exit 1
+          fi
+
+          if [ -z "$TARGET_REPO" ]; then
+            echo "ERROR: Target repository name is empty"
+            exit 1
+          fi
+
           echo "SOURCE_URL=$SOURCE_URL" >> "$GITHUB_ENV"
           echo "SOURCE_OWNER=$SOURCE_OWNER" >> "$GITHUB_ENV"
           echo "SOURCE_REPO=$SOURCE_REPO" >> "$GITHUB_ENV"
-          echo "TARGET_OWNER=$TARGET_OWNER" >> "$GITHUB_ENV"
+          echo "TARGET_PROFILE_URL=$TARGET_PROFILE_URL" >> "$GITHUB_ENV"
+          echo "TARGET_ACCOUNT=$TARGET_ACCOUNT" >> "$GITHUB_ENV"
           echo "TARGET_REPO=$TARGET_REPO" >> "$GITHUB_ENV"
 
           echo "Source owner: $SOURCE_OWNER"
           echo "Source repo: $SOURCE_REPO"
-          echo "Target owner: $TARGET_OWNER"
+          echo "Target profile URL: $TARGET_PROFILE_URL"
+          echo "Target account: $TARGET_ACCOUNT"
           echo "Target repo: $TARGET_REPO"
 
-      - name: Detect Target Owner Type
+      - name: Authenticate Source Token
+        env:
+          GH_TOKEN: ${{ env.SOURCE_PAT }}
         run: |
-          echo "Detecting target owner type..."
+          echo "Validating source token..."
 
-          TARGET_OWNER_TYPE=$(gh api \
-            -H "Accept: application/vnd.github+json" \
-            "users/$TARGET_OWNER" \
-            --jq '.type')
+          SOURCE_AUTH_LOGIN="$(gh api user --jq '.login')"
 
-          if [ "$TARGET_OWNER_TYPE" = "Organization" ]; then
-            echo "Target owner is an Organization"
-            echo "TARGET_OWNER_TYPE=Organization" >> "$GITHUB_ENV"
-          elif [ "$TARGET_OWNER_TYPE" = "User" ]; then
-            echo "Target owner is a Personal User"
-            echo "TARGET_OWNER_TYPE=User" >> "$GITHUB_ENV"
-          else
-            echo "ERROR: Unsupported target owner type: $TARGET_OWNER_TYPE"
+          if [ -z "$SOURCE_AUTH_LOGIN" ]; then
+            echo "ERROR: Unable to authenticate using GH_PAT"
             exit 1
           fi
 
-      - name: Fetch Source Branches
+          echo "SOURCE_AUTH_LOGIN=$SOURCE_AUTH_LOGIN" >> "$GITHUB_ENV"
+          echo "Source token authenticated as: $SOURCE_AUTH_LOGIN"
+
+      - name: Authenticate Target Token
+        env:
+          GH_TOKEN: ${{ env.TARGET_PAT }}
         run: |
-          echo "Fetching source branches..."
+          echo "Validating target token..."
+
+          TARGET_AUTH_LOGIN="$(gh api user --jq '.login')"
+
+          if [ -z "$TARGET_AUTH_LOGIN" ]; then
+            echo "ERROR: Unable to authenticate using target_pat"
+            exit 1
+          fi
+
+          echo "TARGET_AUTH_LOGIN=$TARGET_AUTH_LOGIN" >> "$GITHUB_ENV"
+          echo "Target token authenticated as: $TARGET_AUTH_LOGIN"
+
+      - name: Detect Source And Target Account Type
+        run: |
+          echo "Detecting source account type..."
+
+          SOURCE_ACCOUNT_TYPE="$(GH_TOKEN="$SOURCE_PAT" gh api \
+            -H "Accept: application/vnd.github+json" \
+            "users/$SOURCE_OWNER" \
+            --jq '.type')"
+
+          if [ -z "$SOURCE_ACCOUNT_TYPE" ]; then
+            echo "ERROR: Could not detect source account type"
+            exit 1
+          fi
+
+          echo "SOURCE_ACCOUNT_TYPE=$SOURCE_ACCOUNT_TYPE" >> "$GITHUB_ENV"
+          echo "Source account type: $SOURCE_ACCOUNT_TYPE"
+
+          echo "Detecting target account type..."
+
+          TARGET_ACCOUNT_TYPE="$(GH_TOKEN="$TARGET_PAT" gh api \
+            -H "Accept: application/vnd.github+json" \
+            "users/$TARGET_ACCOUNT" \
+            --jq '.type')"
+
+          if [ "$TARGET_ACCOUNT_TYPE" = "Organization" ]; then
+            echo "Target account is an Organization"
+            echo "TARGET_ACCOUNT_TYPE=Organization" >> "$GITHUB_ENV"
+          elif [ "$TARGET_ACCOUNT_TYPE" = "User" ]; then
+            echo "Target account is a Personal User"
+            echo "TARGET_ACCOUNT_TYPE=User" >> "$GITHUB_ENV"
+          else
+            echo "ERROR: Unsupported target account type: $TARGET_ACCOUNT_TYPE"
+            exit 1
+          fi
+
+      - name: Validate Target Personal Account Permission
+        run: |
+          echo "Validating target account permissions..."
+
+          if [ "$TARGET_ACCOUNT_TYPE" = "User" ]; then
+            if [ "$TARGET_AUTH_LOGIN" != "$TARGET_ACCOUNT" ]; then
+              echo "ERROR: Target is a personal GitHub user: $TARGET_ACCOUNT"
+              echo "ERROR: Provided target PAT belongs to: $TARGET_AUTH_LOGIN"
+              echo "ERROR: For personal user repositories, target PAT must belong to the same target user."
+              exit 1
+            fi
+
+            echo "Personal target account validated"
+          else
+            echo "Target is organization."
+            echo "Provided target PAT user must have repo creation and admin permissions in this organization."
+          fi
+
+      - name: Fetch Source Repository Metadata
+        env:
+          GH_TOKEN: ${{ env.SOURCE_PAT }}
+        run: |
+          echo "Fetching source repository metadata..."
 
           gh api \
             -H "Accept: application/vnd.github+json" \
-            "repos/$SOURCE_OWNER/$SOURCE_REPO/branches" \
-            --jq '.[].name' > source-branches.txt
+            "repos/$SOURCE_OWNER/$SOURCE_REPO" \
+            > source-repo.json
+
+          SOURCE_DEFAULT_BRANCH="$(jq -r '.default_branch // empty' source-repo.json)"
+
+          if [ -z "$SOURCE_DEFAULT_BRANCH" ]; then
+            echo "ERROR: Could not detect source default branch"
+            exit 1
+          fi
+
+          echo "SOURCE_DEFAULT_BRANCH=$SOURCE_DEFAULT_BRANCH" >> "$GITHUB_ENV"
+          echo "Source default branch: $SOURCE_DEFAULT_BRANCH"
+
+      - name: Fetch Source Branches
+        env:
+          GH_TOKEN: ${{ env.SOURCE_PAT }}
+        run: |
+          echo "Fetching source branches..."
+
+          gh api --paginate \
+            -H "Accept: application/vnd.github+json" \
+            "repos/$SOURCE_OWNER/$SOURCE_REPO/branches?per_page=100" \
+            --jq '.[].name' \
+            > source-branches.txt
 
           if [ ! -s source-branches.txt ]; then
             echo "ERROR: No branches found in source repository"
@@ -162,6 +312,8 @@ jobs:
 
       - name: Fetch Source Classic Branch Protection Rules
         if: ${{ inputs.copy_branch_protection == 'true' }}
+        env:
+          GH_TOKEN: ${{ env.SOURCE_PAT }}
         run: |
           echo "Fetching classic branch protection rules from source repository..."
 
@@ -176,7 +328,7 @@ jobs:
 
             echo "Checking protection for branch: $BRANCH"
 
-            ENCODED_BRANCH=$(python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$BRANCH")
+            ENCODED_BRANCH="$(python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$BRANCH")"
 
             if gh api \
               -H "Accept: application/vnd.github+json" \
@@ -196,16 +348,16 @@ jobs:
                   else {
                     strict: (.required_status_checks.strict // false),
                     contexts:
+                    (
+                      .required_status_checks.contexts
+                      //
                       (
-                        .required_status_checks.contexts
-                        //
-                        (
-                          (.required_status_checks.checks // [])
-                          | map(.context // .name // empty)
-                        )
-                        //
-                        []
+                        (.required_status_checks.checks // [])
+                        | map(.context // .name // empty)
                       )
+                      //
+                      []
+                    )
                   }
                   end
                 ),
@@ -273,7 +425,8 @@ jobs:
                 allow_fork_syncing:
                   (.allow_fork_syncing.enabled // false)
               }
-              ' "branch-protections/$BRANCH_KEY.raw.json" > "branch-protections/$BRANCH_KEY.org.json"
+              ' "branch-protections/$BRANCH_KEY.raw.json" \
+              > "branch-protections/$BRANCH_KEY.org.json"
 
               jq '
               .restrictions = null
@@ -288,7 +441,8 @@ jobs:
               else
                 .
               end
-              ' "branch-protections/$BRANCH_KEY.org.json" > "branch-protections/$BRANCH_KEY.user.json"
+              ' "branch-protections/$BRANCH_KEY.org.json" \
+              > "branch-protections/$BRANCH_KEY.user.json"
 
             else
               echo "No classic branch protection found for branch: $BRANCH"
@@ -299,6 +453,8 @@ jobs:
 
       - name: Fetch Source Repository Rulesets
         if: ${{ inputs.copy_rulesets == 'true' }}
+        env:
+          GH_TOKEN: ${{ env.SOURCE_PAT }}
         run: |
           echo "Fetching repository rulesets from source repository..."
 
@@ -309,7 +465,7 @@ jobs:
             "repos/$SOURCE_OWNER/$SOURCE_REPO/rulesets?includes_parents=false" \
             > repo-rulesets/rulesets-list.json
 
-          RULESET_COUNT=$(jq 'length' repo-rulesets/rulesets-list.json)
+          RULESET_COUNT="$(jq 'length' repo-rulesets/rulesets-list.json)"
 
           echo "Repository-level rulesets found: $RULESET_COUNT"
 
@@ -318,7 +474,8 @@ jobs:
             exit 0
           fi
 
-          jq -r '.[].id' repo-rulesets/rulesets-list.json > repo-rulesets/ruleset-ids.txt
+          jq -r '.[].id' repo-rulesets/rulesets-list.json \
+            > repo-rulesets/ruleset-ids.txt
 
           while IFS= read -r RULESET_ID
           do
@@ -338,64 +495,153 @@ jobs:
               conditions: (.conditions // {}),
               rules: (.rules // [])
             }
-            ' "repo-rulesets/$RULESET_ID.raw.json" > "repo-rulesets/$RULESET_ID.org.json"
+            ' "repo-rulesets/$RULESET_ID.raw.json" \
+            > "repo-rulesets/$RULESET_ID.org.json"
 
             jq '
             .bypass_actors = []
-            ' "repo-rulesets/$RULESET_ID.org.json" > "repo-rulesets/$RULESET_ID.user.json"
+            ' "repo-rulesets/$RULESET_ID.org.json" \
+            > "repo-rulesets/$RULESET_ID.user.json"
 
           done < repo-rulesets/ruleset-ids.txt
 
           echo "Completed fetching repository rulesets"
 
-      - name: Create New Repository
+      - name: Create Target Repository
+        env:
+          GH_TOKEN: ${{ env.TARGET_PAT }}
         run: |
-          echo "Creating target repository: $TARGET_OWNER/$TARGET_REPO"
+          echo "Creating target repository: $TARGET_ACCOUNT/$TARGET_REPO"
 
-          if gh repo view "$TARGET_OWNER/$TARGET_REPO" >/dev/null 2>&1
+          if gh repo view "$TARGET_ACCOUNT/$TARGET_REPO" >/dev/null 2>&1
           then
-            echo "Repository already exists: $TARGET_OWNER/$TARGET_REPO"
-          else
-            gh repo create "$TARGET_OWNER/$TARGET_REPO" \
-              --${{ inputs.visibility }}
-
-            echo "Repository created: $TARGET_OWNER/$TARGET_REPO"
+            echo "Repository already exists: $TARGET_ACCOUNT/$TARGET_REPO"
+            exit 0
           fi
 
+          if [ "${{ inputs.visibility }}" = "private" ]; then
+            PRIVATE_FLAG=true
+          else
+            PRIVATE_FLAG=false
+          fi
+
+          if [ "$TARGET_ACCOUNT_TYPE" = "Organization" ]; then
+            echo "Creating repository under organization: $TARGET_ACCOUNT"
+
+            gh api \
+              --method POST \
+              -H "Accept: application/vnd.github+json" \
+              "orgs/$TARGET_ACCOUNT/repos" \
+              -f name="$TARGET_REPO" \
+              -F private="$PRIVATE_FLAG"
+
+          else
+            echo "Creating repository under personal user account: $TARGET_ACCOUNT"
+
+            gh api \
+              --method POST \
+              -H "Accept: application/vnd.github+json" \
+              "user/repos" \
+              -f name="$TARGET_REPO" \
+              -F private="$PRIVATE_FLAG"
+          fi
+
+          echo "Repository created: $TARGET_ACCOUNT/$TARGET_REPO"
+
       - name: Verify Target Repository Exists
+        env:
+          GH_TOKEN: ${{ env.TARGET_PAT }}
         run: |
           echo "Verifying target repository..."
-          gh repo view "$TARGET_OWNER/$TARGET_REPO"
+
+          gh repo view "$TARGET_ACCOUNT/$TARGET_REPO"
+
           echo "Target repository verified"
 
-      - name: Mirror Clone Source Repository
+      - name: Clone Source Repository As Bare Repo
         run: |
-          echo "Mirror cloning source repository..."
+          echo "Cloning source repository with all branches and tags..."
 
-          git clone --mirror \
-            "https://x-access-token:${{ secrets.GH_PAT }}@github.com/$SOURCE_OWNER/$SOURCE_REPO.git" \
-            repo-mirror
+          git clone --bare \
+            "https://x-access-token:${SOURCE_PAT}@github.com/$SOURCE_OWNER/$SOURCE_REPO.git" \
+            repo-bare.git
 
-          echo "Mirror clone completed"
+          echo "Bare clone completed"
 
-      - name: Push Mirror To Target Repository
+      - name: Push All Branches And Tags To Target Repository
         run: |
-          echo "Pushing mirror to target repository..."
+          echo "Pushing all branches and tags to target repository..."
 
-          cd repo-mirror
+          cd repo-bare.git
 
-          git remote set-url origin \
-            "https://x-access-token:${{ secrets.GH_PAT }}@github.com/$TARGET_OWNER/$TARGET_REPO.git"
+          git remote add target \
+            "https://x-access-token:${TARGET_PAT}@github.com/$TARGET_ACCOUNT/$TARGET_REPO.git"
 
-          git push --mirror
+          echo "Pushing all branches..."
+          git push target '+refs/heads/*:refs/heads/*'
 
-          echo "Mirror push completed"
+          echo "Pushing all tags..."
+          git push target '+refs/tags/*:refs/tags/*' || true
+
+          echo "Branches and tags pushed successfully"
+
+      - name: Set Target Default Branch
+        env:
+          GH_TOKEN: ${{ env.TARGET_PAT }}
+        run: |
+          echo "Setting target default branch to source default branch: $SOURCE_DEFAULT_BRANCH"
+
+          if gh api \
+            --method PATCH \
+            -H "Accept: application/vnd.github+json" \
+            "repos/$TARGET_ACCOUNT/$TARGET_REPO" \
+            -f default_branch="$SOURCE_DEFAULT_BRANCH"
+          then
+            echo "Target default branch updated: $SOURCE_DEFAULT_BRANCH"
+          else
+            echo "WARNING: Could not set target default branch to $SOURCE_DEFAULT_BRANCH"
+          fi
+
+      - name: Setup CODEOWNERS
+        if: ${{ inputs.setup_codeowners == 'true' && inputs.team_slug != '' }}
+        run: |
+          echo "Setting up CODEOWNERS..."
+
+          if [ "$TARGET_ACCOUNT_TYPE" != "Organization" ]; then
+            echo "Skipping CODEOWNERS because target account is a personal user"
+            exit 0
+          fi
+
+          git clone \
+            "https://x-access-token:${TARGET_PAT}@github.com/$TARGET_ACCOUNT/$TARGET_REPO.git" \
+            codeowners-repo
+
+          cd codeowners-repo
+
+          git checkout "$SOURCE_DEFAULT_BRANCH"
+
+          mkdir -p .github
+
+          echo "* @$TARGET_ACCOUNT/${{ inputs.team_slug }}" > .github/CODEOWNERS
+
+          git config user.email "actions@github.com"
+          git config user.name "GitHub Actions"
+
+          git add .github/CODEOWNERS
+
+          git commit -m "chore: add CODEOWNERS file" || echo "Nothing to commit"
+
+          git push origin "$SOURCE_DEFAULT_BRANCH"
+
+          echo "CODEOWNERS setup completed"
 
       - name: Apply Classic Branch Protection Rules To Target Repository
         if: ${{ inputs.copy_branch_protection == 'true' }}
+        env:
+          GH_TOKEN: ${{ env.TARGET_PAT }}
         run: |
           echo "Applying classic branch protection rules to target repository..."
-          echo "Target owner type: $TARGET_OWNER_TYPE"
+          echo "Target account type: $TARGET_ACCOUNT_TYPE"
 
           if [ ! -d branch-protections ]; then
             echo "No branch protection data found"
@@ -413,8 +659,8 @@ jobs:
               exit 0
             fi
 
-            BRANCH_KEY=$(basename "$BRANCH_FILE" .branch)
-            BRANCH=$(cat "$BRANCH_FILE")
+            BRANCH_KEY="$(basename "$BRANCH_FILE" .branch)"
+            BRANCH="$(cat "$BRANCH_FILE")"
 
             if [ -z "$BRANCH" ]; then
               echo "Skipping empty branch file: $BRANCH_FILE"
@@ -422,7 +668,7 @@ jobs:
               continue
             fi
 
-            if [ "$TARGET_OWNER_TYPE" = "Organization" ]; then
+            if [ "$TARGET_ACCOUNT_TYPE" = "Organization" ]; then
               PAYLOAD_FILE="branch-protections/$BRANCH_KEY.org.json"
             else
               PAYLOAD_FILE="branch-protections/$BRANCH_KEY.user.json"
@@ -436,21 +682,21 @@ jobs:
 
             echo "Applying protection to target branch: $BRANCH"
 
-            ENCODED_BRANCH=$(python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$BRANCH")
+            ENCODED_BRANCH="$(python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$BRANCH")"
 
             if gh api \
               --method PUT \
               -H "Accept: application/vnd.github+json" \
-              "repos/$TARGET_OWNER/$TARGET_REPO/branches/$ENCODED_BRANCH/protection" \
+              "repos/$TARGET_ACCOUNT/$TARGET_REPO/branches/$ENCODED_BRANCH/protection" \
               --input "$PAYLOAD_FILE"
             then
               echo "Applied protection to branch: $BRANCH"
               APPLIED_COUNT=$((APPLIED_COUNT + 1))
             else
               echo "Full protection failed for branch: $BRANCH"
-              echo "Retrying with personal-safe payload..."
+              echo "Retrying with safe payload..."
 
-              SAFE_FILE="branch-protections/$BRANCH_KEY.personal-safe.json"
+              SAFE_FILE="branch-protections/$BRANCH_KEY.safe.json"
 
               jq '
               .restrictions = null
@@ -465,21 +711,22 @@ jobs:
               else
                 .
               end
-              ' "branch-protections/$BRANCH_KEY.org.json" > "$SAFE_FILE"
+              ' "branch-protections/$BRANCH_KEY.org.json" \
+              > "$SAFE_FILE"
 
               if gh api \
                 --method PUT \
                 -H "Accept: application/vnd.github+json" \
-                "repos/$TARGET_OWNER/$TARGET_REPO/branches/$ENCODED_BRANCH/protection" \
+                "repos/$TARGET_ACCOUNT/$TARGET_REPO/branches/$ENCODED_BRANCH/protection" \
                 --input "$SAFE_FILE"
               then
-                echo "Applied personal-safe protection to branch: $BRANCH"
+                echo "Applied safe protection to branch: $BRANCH"
                 APPLIED_COUNT=$((APPLIED_COUNT + 1))
               else
-                echo "Personal-safe protection failed for branch: $BRANCH"
+                echo "Safe protection failed for branch: $BRANCH"
                 echo "Retrying without required status checks..."
 
-                SAFE_NO_CHECKS_FILE="branch-protections/$BRANCH_KEY.personal-safe-no-checks.json"
+                SAFE_NO_CHECKS_FILE="branch-protections/$BRANCH_KEY.safe-no-checks.json"
 
                 jq '
                 .restrictions = null
@@ -496,12 +743,13 @@ jobs:
                 else
                   .
                 end
-                ' "branch-protections/$BRANCH_KEY.org.json" > "$SAFE_NO_CHECKS_FILE"
+                ' "branch-protections/$BRANCH_KEY.org.json" \
+                > "$SAFE_NO_CHECKS_FILE"
 
                 if gh api \
                   --method PUT \
                   -H "Accept: application/vnd.github+json" \
-                  "repos/$TARGET_OWNER/$TARGET_REPO/branches/$ENCODED_BRANCH/protection" \
+                  "repos/$TARGET_ACCOUNT/$TARGET_REPO/branches/$ENCODED_BRANCH/protection" \
                   --input "$SAFE_NO_CHECKS_FILE"
                 then
                   echo "Applied protection without status checks to branch: $BRANCH"
@@ -525,9 +773,11 @@ jobs:
 
       - name: Apply Repository Rulesets To Target Repository
         if: ${{ inputs.copy_rulesets == 'true' }}
+        env:
+          GH_TOKEN: ${{ env.TARGET_PAT }}
         run: |
           echo "Applying repository rulesets to target repository..."
-          echo "Target owner type: $TARGET_OWNER_TYPE"
+          echo "Target account type: $TARGET_ACCOUNT_TYPE"
 
           if [ ! -f repo-rulesets/ruleset-ids.txt ]; then
             echo "No repository-level rulesets found to apply"
@@ -539,7 +789,7 @@ jobs:
 
           while IFS= read -r RULESET_ID
           do
-            if [ "$TARGET_OWNER_TYPE" = "Organization" ]; then
+            if [ "$TARGET_ACCOUNT_TYPE" = "Organization" ]; then
               CLEAN_FILE="repo-rulesets/$RULESET_ID.org.json"
             else
               CLEAN_FILE="repo-rulesets/$RULESET_ID.user.json"
@@ -551,14 +801,14 @@ jobs:
               continue
             fi
 
-            RULESET_NAME=$(jq -r '.name // "unknown-ruleset"' "$CLEAN_FILE")
+            RULESET_NAME="$(jq -r '.name // "unknown-ruleset"' "$CLEAN_FILE")"
 
             echo "Creating ruleset in target repository: $RULESET_NAME"
 
             if gh api \
               --method POST \
               -H "Accept: application/vnd.github+json" \
-              "repos/$TARGET_OWNER/$TARGET_REPO/rulesets" \
+              "repos/$TARGET_ACCOUNT/$TARGET_REPO/rulesets" \
               --input "$CLEAN_FILE"
             then
               echo "Created ruleset: $RULESET_NAME"
@@ -569,14 +819,12 @@ jobs:
 
               RETRY_FILE="repo-rulesets/$RULESET_ID.retry-no-bypass.json"
 
-              jq '
-              .bypass_actors = []
-              ' "$CLEAN_FILE" > "$RETRY_FILE"
+              jq '.bypass_actors = []' "$CLEAN_FILE" > "$RETRY_FILE"
 
               if gh api \
                 --method POST \
                 -H "Accept: application/vnd.github+json" \
-                "repos/$TARGET_OWNER/$TARGET_REPO/rulesets" \
+                "repos/$TARGET_ACCOUNT/$TARGET_REPO/rulesets" \
                 --input "$RETRY_FILE"
               then
                 echo "Created ruleset without bypass actors: $RULESET_NAME"
@@ -594,42 +842,13 @@ jobs:
           echo "Failed: $FAILED_RULESETS"
 
           if [ "$FAILED_RULESETS" -gt 0 ]; then
-            echo "WARNING: Some rulesets failed to apply"
+            echo "WARNING: Some repository rulesets failed to apply"
           fi
-
-      - name: Setup CODEOWNERS
-        if: ${{ inputs.team_slug != '' }}
-        run: |
-          echo "Setting up CODEOWNERS..."
-
-          if [ "$TARGET_OWNER_TYPE" != "Organization" ]; then
-            echo "Skipping CODEOWNERS team entry because target owner is personal user"
-            exit 0
-          fi
-
-          git clone \
-            "https://x-access-token:${{ secrets.GH_PAT }}@github.com/$TARGET_OWNER/$TARGET_REPO.git" \
-            codeowners-repo
-
-          cd codeowners-repo
-
-          mkdir -p .github
-
-          echo "* @$TARGET_OWNER/${{ inputs.team_slug }}" > .github/CODEOWNERS
-
-          git config user.email "actions@github.com"
-          git config user.name "GitHub Actions"
-
-          git add .github/CODEOWNERS
-
-          git commit -m "chore: add CODEOWNERS file" || echo "Nothing to commit"
-
-          git push
-
-          echo "CODEOWNERS setup completed"
 
       - name: Verify Applied Classic Branch Protections
         if: ${{ inputs.copy_branch_protection == 'true' }}
+        env:
+          GH_TOKEN: ${{ env.TARGET_PAT }}
         run: |
           echo "Verifying applied classic branch protections..."
 
@@ -645,14 +864,14 @@ jobs:
               exit 0
             fi
 
-            BRANCH=$(cat "$BRANCH_FILE")
-            ENCODED_BRANCH=$(python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$BRANCH")
+            BRANCH="$(cat "$BRANCH_FILE")"
+            ENCODED_BRANCH="$(python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$BRANCH")"
 
             echo "Checking target protection for branch: $BRANCH"
 
             if gh api \
               -H "Accept: application/vnd.github+json" \
-              "repos/$TARGET_OWNER/$TARGET_REPO/branches/$ENCODED_BRANCH/protection" >/dev/null 2>&1
+              "repos/$TARGET_ACCOUNT/$TARGET_REPO/branches/$ENCODED_BRANCH/protection" >/dev/null 2>&1
             then
               echo "Verified protection exists for branch: $BRANCH"
             else
@@ -660,18 +879,49 @@ jobs:
             fi
           done
 
+      - name: Verify Applied Repository Rulesets
+        if: ${{ inputs.copy_rulesets == 'true' }}
+        env:
+          GH_TOKEN: ${{ env.TARGET_PAT }}
+        run: |
+          echo "Verifying repository rulesets on target repository..."
+
+          if gh api \
+            -H "Accept: application/vnd.github+json" \
+            "repos/$TARGET_ACCOUNT/$TARGET_REPO/rulesets?includes_parents=false" \
+            > target-rulesets.json
+          then
+            TARGET_RULESET_COUNT="$(jq 'length' target-rulesets.json)"
+            echo "Target repository rulesets found: $TARGET_RULESET_COUNT"
+            jq -r '.[].name' target-rulesets.json || true
+          else
+            echo "WARNING: Could not verify target repository rulesets"
+          fi
+
       - name: Final Summary
         run: |
           echo "Repository clone workflow completed"
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "----------------------------------------"
           echo "Source Repository:"
           echo "https://github.com/$SOURCE_OWNER/$SOURCE_REPO"
           echo ""
-          echo "Target Repository:"
-          echo "https://github.com/$TARGET_OWNER/$TARGET_REPO"
+          echo "Source Default Branch:"
+          echo "$SOURCE_DEFAULT_BRANCH"
           echo ""
-          echo "Target Owner Type:"
-          echo "$TARGET_OWNER_TYPE"
+          echo "Target Profile URL:"
+          echo "$TARGET_PROFILE_URL"
+          echo ""
+          echo "Target Repository:"
+          echo "https://github.com/$TARGET_ACCOUNT/$TARGET_REPO"
+          echo ""
+          echo "Target Account Type:"
+          echo "$TARGET_ACCOUNT_TYPE"
+          echo ""
+          echo "Source Token User:"
+          echo "$SOURCE_AUTH_LOGIN"
+          echo ""
+          echo "Target Token User:"
+          echo "$TARGET_AUTH_LOGIN"
           echo ""
           echo "Visibility:"
           echo "${{ inputs.visibility }}"
@@ -682,6 +932,9 @@ jobs:
           echo "Repository Ruleset Copy:"
           echo "${{ inputs.copy_rulesets }}"
           echo ""
+          echo "CODEOWNERS Setup:"
+          echo "${{ inputs.setup_codeowners }}"
+          echo ""
           echo "CODEOWNERS Team:"
           echo "${{ inputs.team_slug }}"
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "----------------------------------------"
